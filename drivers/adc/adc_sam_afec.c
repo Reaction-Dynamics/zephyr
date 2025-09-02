@@ -300,6 +300,18 @@ static int adc_sam_init(const struct device *dev)
 	(void)clock_control_on(SAM_DT_PMC_CONTROLLER,
 			       (clock_control_subsys_t)&cfg->clock_cfg);
 
+
+	// NOTE if we could change the *pin here then we would also be able to allow pinctrl to take care
+	// of the clock_control via soc_pmc_peripheral_enable(periph_id);
+	/* for (uint8_t i = 0U; i < cfg->pcfg->states[PINCTRL_STATE_DEFAULT].pin_cnt; i++) { */
+	/* 	volatile pinctrl_soc_pin_t *pin = &cfg->pcfg->states[PINCTRL_STATE_DEFAULT].pins[i]; */
+	/* 	volatile uint8_t port_func = SAM_PINMUX_FUNC_GET(pin); */
+	/* 	if (port_func != SAM_PINMUX_FUNC_extra) { */
+	/* 		return -1; */
+	/* 	} */
+
+	/* 	*pin |= SOC_GPIO_FUNC_IN << SAM_PINMUX_PERIPH_POS; */
+	/* } */
 	/* Connect pins to the peripheral */
 	retval = pinctrl_apply_state(cfg->pcfg, PINCTRL_STATE_DEFAULT);
 	if (retval < 0) {
