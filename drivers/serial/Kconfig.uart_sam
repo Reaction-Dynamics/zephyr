@@ -11,5 +11,12 @@ config UART_SAM
 	select PINCTRL
 	select SERIAL_HAS_DRIVER
 	select SERIAL_SUPPORT_INTERRUPT
+	select SERIAL_SUPPORT_ASYNC if DT_HAS_ATMEL_SAM_XDMAC_ENABLED
 	help
 	  This option enables the UARTx driver for Atmel SAM MCUs.
+
+config UART_SAM_ASYNC
+	bool "Async UART support for Atmel SAM0 series."
+	depends on DMA_SAM_XDMAC
+	depends on UART_SAM
+	depends on UART_ASYNC_API
