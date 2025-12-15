@@ -191,52 +191,21 @@ static void uart_sam_dma_tx_done(const struct device *dma_dev, void *arg,
     ARG_UNUSED(dma_dev);
     ARG_UNUSED(id);
 
-    struct uart_sam_dev_data *const data = (struct uart_sam_dev_data *const)arg;
-    const struct device *dev = data->dev;
+    struct uart_sam_dev_data *const dev_data =
+        (struct uart_sam_dev_data *const)arg;
+    const struct device *dev = dev_data->dev;
     const struct uart_sam_dev_cfg *const cfg = dev->config;
-    volatile Uart *const uart = cfg->regs;
-
-    unsigned int key = irq_lock();
-
-    (void)k_work_cancel_delayable(&data->tx_timeout_work);
+    Uart *const regs = cfg->regs;
 
     if (error_code < 0) {
         LOG_ERR("TX DMA error: %d", error_code);
-        // Handle error immediately
-        if (data->async_cb) {
-            struct uart_event evt = {
-                .type = UART_TX_ABORTED,
-                .data.tx = {
-                    .buf = data->tx_buf,
-                    .len = data->tx_len,
-                },
-            };
-            data->async_cb(dev, &evt, data->async_cb_data);
-        }
-        data->tx_buf = NULL;
-        data->tx_len = 0;
-        irq_unlock(key);
+        // Handle error in ISR instead
+        regs->UART_IER = UART_IER_TXEMPTY;
         return;
     }
 
-    if (data->async_cb) {
-        struct uart_event evt = {
-            .type = UART_TX_DONE,
-            .data.tx = {
-                .buf = data->tx_buf,
-                .len = data->tx_len,
-            },
-        };
-        data->async_cb(dev, &evt, data->async_cb_data);
-    }
-
-	/* Reset TX Buffer */
-    data->tx_buf = NULL;
-    data->tx_len = 0;
-
-    irq_unlock(key);
-    // Don't fire UART_TX_DONE event yet!
-    // Wait for UART ISR to do it
+    // Enable UART interrupt to detect true completion
+    regs->UART_IER = UART_IER_TXEMPTY;
 }
 
 static int uart_sam_tx_halt(struct uart_sam_dev_data *dev_data)
@@ -844,7 +813,46 @@ static void uart_sam_isr(const struct device *dev)
     uint32_t pending = status & imr;
 
 #if CONFIG_UART_SAM_ASYNC
-    // Handle errors
+    // TX Complete - UART truly done transmitting
+    if (data->tx_len && (pending & UART_SR_TXEMPTY)) {
+        regs->UART_IDR = UART_IDR_TXEMPTY;
+        k_work_cancel_delayable(&data->tx_timeout_work);
+
+        unsigned int key = irq_lock();
+
+        struct uart_event evt = {
+            .type = UART_TX_DONE,
+            .data.tx = {
+                .buf = data->tx_buf,
+                .len = data->tx_len,
+            },
+        };
+
+        data->tx_buf = NULL;
+        data->tx_len = 0U;
+
+        if (evt.data.tx.len != 0U && data->async_cb) {
+            data->async_cb(dev, &evt, data->async_cb_data);
+        }
+
+        irq_unlock(key);
+    }
+
+    // RX Ready
+    if (pending & UART_SR_RXRDY) {
+        regs->UART_CR = UART_CR_RSTSTA;
+
+        if (data->async_cb) {
+            struct uart_event evt = {
+                .type = UART_RX_RDY,
+                .data.rx_stop.data.buf = data->rx_buf,
+                .data.rx_stop.data.len = data->rx_offset,
+            };
+            data->async_cb(dev, &evt, data->async_cb_data);
+        }
+    }
+
+    // Error handling
     if (pending & (UART_SR_OVRE | UART_SR_FRAME | UART_SR_PARE)) {
         regs->UART_IDR = UART_SR_OVRE | UART_SR_FRAME | UART_SR_PARE;
         regs->UART_CR = UART_CR_RSTSTA;
