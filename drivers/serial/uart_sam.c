@@ -75,7 +75,6 @@ struct uart_sam_dev_data {
     const uint8_t *tx_buf;
     size_t tx_len;
     struct k_work_delayable tx_timeout_work;
-    bool tx_enabled;
 
     /* Callback */
     uart_callback_t async_cb;
@@ -185,24 +184,39 @@ static int uart_sam_baudrate_set(const struct device *dev, uint32_t baudrate)
 
 #if CONFIG_UART_SAM_ASYNC
 
+// DMA callback - triggered when DMA finishes writing to UART_THR
 static void uart_sam_dma_tx_done(const struct device *dma_dev, void *arg,
-				  uint32_t id, int error_code)
+                                 uint32_t id, int error_code)
 {
-	ARG_UNUSED(dma_dev);
-	ARG_UNUSED(id);
-	ARG_UNUSED(error_code);
+    ARG_UNUSED(dma_dev);
+    ARG_UNUSED(id);
 
-	struct uart_sam_dev_data *const data =
-		(struct uart_sam_dev_data *const) arg;
+    struct uart_sam_dev_data *const data = (struct uart_sam_dev_data *const)arg;
     const struct device *dev = data->dev;
-	/* const struct uart_sam_dev_cfg *const cfg = dev->config; */
+    const struct uart_sam_dev_cfg *const cfg = dev->config;
+    volatile Uart *const uart = cfg->regs;
 
     unsigned int key = irq_lock();
 
-    k_work_cancel_delayable(&data->tx_timeout_work);
+    (void)k_work_cancel_delayable(&data->tx_timeout_work);
 
     if (error_code < 0) {
         LOG_ERR("TX DMA error: %d", error_code);
+        // Handle error immediately
+        if (data->async_cb) {
+            struct uart_event evt = {
+                .type = UART_TX_ABORTED,
+                .data.tx = {
+                    .buf = data->tx_buf,
+                    .len = data->tx_len,
+                },
+            };
+            data->async_cb(dev, &evt, data->async_cb_data);
+        }
+        data->tx_buf = NULL;
+        data->tx_len = 0;
+        irq_unlock(key);
+        return;
     }
 
     if (data->async_cb) {
@@ -216,15 +230,13 @@ static void uart_sam_dma_tx_done(const struct device *dma_dev, void *arg,
         data->async_cb(dev, &evt, data->async_cb_data);
     }
 
+	/* Reset TX Buffer */
     data->tx_buf = NULL;
     data->tx_len = 0;
-    data->tx_enabled = false;
-
-	/* SercomUsart * const regs = cfg->regs; */
-
-	/* regs->INTENSET.reg = SERCOM_USART_INTENSET_TXC; */
 
     irq_unlock(key);
+    // Don't fire UART_TX_DONE event yet!
+    // Wait for UART ISR to do it
 }
 
 static int uart_sam_tx_halt(struct uart_sam_dev_data *dev_data)
@@ -820,32 +832,28 @@ static void uart_sam_irq_callback_set(const struct device *dev,
 #endif
 #if CONFIG_UART_INTERRUPT_DRIVEN || CONFIG_UART_SAM_ASYNC
 
+// UART ISR - handle actual transmission completion
 static void uart_sam_isr(const struct device *dev)
 {
-	struct uart_sam_dev_data *const data = dev->data;
-
-	/* if (data->irq_cb) { */
-	/* 	data->irq_cb(dev, data->irq_cb_data); */
-	/* } */
-#if CONFIG_UART_SAM_ASYNC
-	const struct uart_sam_dev_cfg *const cfg = dev->config;
+    struct uart_sam_dev_data *const data = dev->data;
+    const struct uart_sam_dev_cfg *const cfg = dev->config;
     Uart *regs = cfg->regs;
 
     uint32_t status = regs->UART_SR;
     uint32_t imr = regs->UART_IMR;
     uint32_t pending = status & imr;
 
-    /* Check for errors */
+#if CONFIG_UART_SAM_ASYNC
+    // Handle errors
     if (pending & (UART_SR_OVRE | UART_SR_FRAME | UART_SR_PARE)) {
-        /* Disable error interrupts */
         regs->UART_IDR = UART_SR_OVRE | UART_SR_FRAME | UART_SR_PARE;
-
-        /* Clear status */
         regs->UART_CR = UART_CR_RSTSTA;
 
         if (data->async_cb) {
             struct uart_event evt = {
                 .type = UART_RX_STOPPED,
+                .data.rx_stop.data.buf = data->rx_buf,
+                .data.rx_stop.data.len = data->rx_offset,
             };
 
             if (pending & UART_SR_OVRE) {
@@ -856,17 +864,19 @@ static void uart_sam_isr(const struct device *dev)
                 evt.data.rx_stop.reason = UART_ERROR_PARITY;
             }
 
-            evt.data.rx_stop.data.buf = data->rx_buf;
-            evt.data.rx_stop.data.len = data->rx_offset;
-
             data->async_cb(dev, &evt, data->async_cb_data);
         }
 
-        /* Stop RX DMA on error */
         if (data->rx_enabled) {
             dma_stop(cfg->dma_dev, cfg->rx_dma_channel);
             data->rx_enabled = false;
         }
+    }
+#endif
+
+#if CONFIG_UART_INTERRUPT_DRIVEN
+    if (data->irq_cb) {
+        data->irq_cb(dev, data->irq_cb_data);
     }
 #endif
 }
@@ -899,6 +909,8 @@ static int uart_sam_tx(const struct device *dev, const uint8_t *buf,
 	struct uart_sam_dev_data *const dev_data = dev->data;
 	const struct uart_sam_dev_cfg *const cfg = dev->config;
 	Uart *regs = cfg->regs;
+
+
 	int retval;
 
 	if (cfg->tx_dma_channel == 0xFFU) {
@@ -919,11 +931,12 @@ static int uart_sam_tx(const struct device *dev, const uint8_t *buf,
 	dev_data->tx_buf = buf;
 	dev_data->tx_len = len;
 
-	irq_unlock(key);
-
 	retval = dma_reload(cfg->dma_dev, cfg->tx_dma_channel, (uint32_t)buf,
 						(uint32_t)(&(regs->UART_THR)), len);
 	if (retval != 0U) {
+        dev_data->tx_buf = NULL;
+        dev_data->tx_len = 0;
+        irq_unlock(key);
 		return retval;
 	}
 
@@ -932,7 +945,18 @@ static int uart_sam_tx(const struct device *dev, const uint8_t *buf,
 				      K_USEC(timeout));
 	}
 
-	return dma_start(cfg->dma_dev, cfg->tx_dma_channel);
+	retval = dma_start(cfg->dma_dev, cfg->tx_dma_channel);
+	if (retval != 0U) {
+        k_work_cancel_delayable(&dev_data->tx_timeout_work);
+        dev_data->tx_buf = NULL;
+        dev_data->tx_len = 0;
+        irq_unlock(key);
+		return retval;
+	}
+	/* regs->UART_IER = UART_IER_TXRDY; */
+
+    irq_unlock(key);
+    return retval;
 err:
 	irq_unlock(key);
 	return retval;
@@ -962,6 +986,12 @@ static int uart_sam_configure_rx_dma(const struct device *dev,
     struct uart_sam_dev_data *const data = dev->data;
     Uart *regs = cfg->regs;
 
+    /* Validate DMA is available */
+    if (!device_is_ready(cfg->dma_dev)) {
+        LOG_ERR("DMA device not ready");
+        return -ENODEV;
+    }
+
     struct dma_block_config dma_blk = {
         .source_address = (uint32_t)&regs->UART_RHR,
         .dest_address = (uint32_t)buf,
@@ -980,6 +1010,7 @@ static int uart_sam_configure_rx_dma(const struct device *dev,
         .dma_callback = uart_sam_dma_rx_done,
         .user_data = data,
         .dma_slot = cfg->rx_dma_request,
+        .block_count = 1,
     };
 
     int ret = dma_config(cfg->dma_dev, cfg->rx_dma_channel, &dma_cfg);
@@ -1067,7 +1098,7 @@ static int uart_sam_rx_enable(const struct device *dev, uint8_t *buf,
 
     /* Enable UART receiver and error interrupts */
     regs->UART_CR = UART_CR_RXEN;
-    regs->UART_IER = UART_SR_OVRE | UART_SR_FRAME | UART_SR_PARE;
+    regs->UART_IER = UART_SR_OVRE | UART_SR_FRAME | UART_SR_PARE | UART_IER_RXRDY;
 
     /* Configure DMA transfer */
     ret = uart_sam_configure_rx_dma(dev, buf, len);
@@ -1139,7 +1170,7 @@ static int uart_sam_rx_disable(const struct device *dev)
 {
 	struct uart_sam_dev_data *const dev_data = dev->data;
 	const struct uart_sam_dev_cfg *const cfg = dev->config;
-	/* SercomUsart * const regs = cfg->regs; */
+	Uart * const regs = cfg->regs;
 	struct dma_status st;
 
 	k_work_cancel_delayable(&dev_data->rx_timeout_work);
@@ -1151,7 +1182,7 @@ static int uart_sam_rx_disable(const struct device *dev)
 		return -EINVAL;
 	}
 
-	/* regs->INTENCLR.reg = SERCOM_USART_INTENCLR_RXC; */
+	regs->UART_CR = UART_CR_REQCLR;
 	dma_stop(cfg->dma_dev, cfg->rx_dma_channel);
 
 
@@ -1206,45 +1237,47 @@ static int uart_sam_rx_disable(const struct device *dev)
 
 static int uart_sam_init(const struct device *dev)
 {
-	int retval;
+    int retval;
+    const struct uart_sam_dev_cfg *const cfg = dev->config;
+    struct uart_sam_dev_data *const dev_data = dev->data;
+    Uart *const uart = cfg->regs;
 
-	const struct uart_sam_dev_cfg *const cfg = dev->config;
+    /* Enable UART clock in PMC */
+    (void)clock_control_on(SAM_DT_PMC_CONTROLLER,
+                   (clock_control_subsys_t)&cfg->clock_cfg);
 
-	struct uart_sam_dev_data *const dev_data = dev->data;
+    /* Connect pins to the peripheral */
+    retval = pinctrl_apply_state(cfg->pcfg, PINCTRL_STATE_DEFAULT);
+    if (retval < 0) {
+        return retval;
+    }
 
-	Uart * const uart = cfg->regs;
-
-	/* Enable UART clock in PMC */
-	(void)clock_control_on(SAM_DT_PMC_CONTROLLER,
-			       (clock_control_subsys_t)&cfg->clock_cfg);
-
-	/* Connect pins to the peripheral */
-	retval = pinctrl_apply_state(cfg->pcfg, PINCTRL_STATE_DEFAULT);
-	if (retval < 0) {
-		return retval;
-	}
-
-	/* Disable Interrupts */
-	uart->UART_IDR = 0xFFFFFFFF;
+    /* Disable all interrupts */
+    uart->UART_IDR = 0xFFFFFFFF;
 
 #if CONFIG_UART_INTERRUPT_DRIVEN || CONFIG_UART_SAM_ASYNC
-	cfg->irq_config_func(dev);
-#endif /* CONFIG_UART_INTERRUPT_DRIVEN */
+    cfg->irq_config_func(dev);
+#endif
+
 #ifdef CONFIG_UART_SAM_ASYNC
-	dev_data->dev = dev;
-	/* dev_data->dev->config = cfg; */
-	if (!device_is_ready(cfg->dma_dev)) {
-		return -ENODEV;
-	}
+    dev_data->dev = dev;
 
-	k_work_init_delayable(&dev_data->tx_timeout_work, uart_sam_tx_timeout);
-	k_work_init_delayable(&dev_data->rx_timeout_work, uart_sam_rx_timeout);
+    /* Verify DMA device is ready */
+    if (!device_is_ready(cfg->dma_dev)) {
+        LOG_ERR("DMA device not ready");
+        return -ENODEV;
+    }
 
+    /* Initialize work items */
+    k_work_init_delayable(&dev_data->tx_timeout_work, uart_sam_tx_timeout);
+    k_work_init_delayable(&dev_data->rx_timeout_work, uart_sam_rx_timeout);
+
+	// Since we don't "enable" tx we need to do configure the dma on startup
 	if (cfg->tx_dma_channel != 0xFFU) {
 		struct dma_config dma_cfg = { 0 };
 		struct dma_block_config dma_blk = { 0 };
 
-		/* dma_cfg.channel_direction = MEMORY_TO_PERIPHERAL; */
+		dma_cfg.channel_direction = MEMORY_TO_PERIPHERAL;
 		dma_cfg.source_data_size = 1;
 		dma_cfg.dest_data_size = 1;
 		dma_cfg.user_data = dev_data;
@@ -1253,8 +1286,9 @@ static int uart_sam_init(const struct device *dev)
 		dma_cfg.head_block = &dma_blk;
 		dma_cfg.dma_slot = cfg->tx_dma_request;
 
+        // Set's the following as sane defaults
 		dma_blk.block_size = 1;
-		/* dma_blk.dest_address = (uint32_t)(&(usart->DATA.reg)); */
+		dma_blk.dest_address = (uint32_t)(&(uart->UART_THR));
 		dma_blk.dest_addr_adj = DMA_ADDR_ADJ_NO_CHANGE;
 
 		retval = dma_config(cfg->dma_dev, cfg->tx_dma_channel,
@@ -1264,40 +1298,24 @@ static int uart_sam_init(const struct device *dev)
 		}
 	}
 
-	if (cfg->rx_dma_channel != 0xFFU) {
-		struct dma_config dma_cfg = { 0 };
-		struct dma_block_config dma_blk = { 0 };
-
-		dma_cfg.channel_direction = PERIPHERAL_TO_MEMORY;
-		dma_cfg.source_data_size = 1;
-		dma_cfg.dest_data_size = 1;
-		dma_cfg.user_data = dev_data;
-		dma_cfg.dma_callback = uart_sam_dma_rx_done;
-		dma_cfg.block_count = 1;
-		dma_cfg.head_block = &dma_blk;
-		dma_cfg.dma_slot = cfg->rx_dma_request;
-
-		dma_blk.block_size = 1;
-		/* dma_blk.source_address = (uint32_t)(&(usart->DATA.reg)); */
-		dma_blk.source_addr_adj = DMA_ADDR_ADJ_NO_CHANGE;
-
-		retval = dma_config(cfg->dma_dev, cfg->rx_dma_channel,
-				    &dma_cfg);
-		if (retval != 0) {
-			return retval;
-		}
-	}
-
+    /* Initialize async state with null DMA configuration */
+    dev_data->rx_enabled = false;
+    dev_data->tx_buf = NULL;
+    dev_data->rx_buf = NULL;
+    dev_data->tx_len = 0;
+    dev_data->rx_len = 0;
 #endif
 
-	struct uart_config uart_config = {
-		.baudrate = dev_data->baud_rate,
-		.parity = UART_CFG_PARITY_NONE,
-		.stop_bits = UART_CFG_STOP_BITS_1,
-		.data_bits = UART_CFG_DATA_BITS_8,
-		.flow_ctrl = UART_CFG_FLOW_CTRL_NONE,
-	};
-	return uart_sam_configure(dev, &uart_config);
+    /* Configure UART parameters */
+    struct uart_config uart_config = {
+        .baudrate = dev_data->baud_rate,
+        .parity = UART_CFG_PARITY_NONE,
+        .stop_bits = UART_CFG_STOP_BITS_1,
+        .data_bits = UART_CFG_DATA_BITS_8,
+        .flow_ctrl = UART_CFG_FLOW_CTRL_NONE,
+    };
+
+    return uart_sam_configure(dev, &uart_config);
 }
 
 static DEVICE_API(uart, uart_sam_driver_api) = {
