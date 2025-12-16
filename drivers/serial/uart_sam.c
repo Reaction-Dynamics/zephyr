@@ -929,9 +929,6 @@ static int uart_sam_tx(const struct device *dev, const uint8_t *buf,
 	if (len > 0xFFFFU) {
 		return -EINVAL;
 	}
-#ifdef CONFIG_DCACHE
-    SCB_CleanDCache_by_Addr((uint32_t *)buf, len);
-#endif
 
 	unsigned int key = irq_lock();
 
@@ -1298,11 +1295,14 @@ static int uart_sam_init(const struct device *dev)
 		dma_cfg.block_count = 1;
 		dma_cfg.head_block = &dma_blk;
 		dma_cfg.dma_slot = cfg->tx_dma_request;
+        dma_cfg.source_burst_length = 1,
+        dma_cfg.dest_burst_length = 1,
 
         // Set's the following as sane defaults
 		dma_blk.block_size = 1;
 		dma_blk.dest_address = (uint32_t)(&(uart->UART_THR));
 		dma_blk.dest_addr_adj = DMA_ADDR_ADJ_NO_CHANGE;
+		dma_blk.source_addr_adj = DMA_ADDR_ADJ_INCREMENT;
 
 		retval = dma_config(cfg->dma_dev, cfg->tx_dma_channel,
 				    &dma_cfg);
