@@ -5,6 +5,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+#include "zephyr/cache.h"
 #define DT_DRV_COMPAT atmel_sam_uart
 
 #include <errno.h>
@@ -928,6 +929,9 @@ static int uart_sam_tx(const struct device *dev, const uint8_t *buf,
 	if (len > 0xFFFFU) {
 		return -EINVAL;
 	}
+#ifdef CONFIG_DCACHE
+    SCB_CleanDCache_by_Addr((uint32_t *)buf, len);
+#endif
 
 	unsigned int key = irq_lock();
 
@@ -935,12 +939,13 @@ static int uart_sam_tx(const struct device *dev, const uint8_t *buf,
 		retval = -EBUSY;
 		goto err;
 	}
-
 	dev_data->tx_buf = buf;
 	dev_data->tx_len = len;
-
-	retval = dma_reload(cfg->dma_dev, cfg->tx_dma_channel, (uint32_t)buf,
-						(uint32_t)(&(regs->UART_THR)), len);
+/* #ifdef CONFIG_CACHE_MANAGEMENT */
+/*     sys_cache_data_flush_range((void *)buf, len); */
+/* #endif */
+	retval = dma_reload(cfg->dma_dev, cfg->tx_dma_channel, (uintptr_t)buf,
+						(uintptr_t)(&(regs->UART_THR)), len);
 	if (retval != 0U) {
         dev_data->tx_buf = NULL;
         dev_data->tx_len = 0;
