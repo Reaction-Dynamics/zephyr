@@ -400,6 +400,14 @@ static void uart_sam_dma_rx_done(const struct device *dma_dev, void *arg,
         return;
     }
 
+    #ifdef CONFIG_DCACHE
+    // Invalidate cache AFTER DMA completes to ensure fresh data
+    uintptr_t cache_start = (uintptr_t)data->rx_buf & ~0x1F;
+    uintptr_t buf_end = (uintptr_t)data->rx_buf + data->rx_len - 1;
+    size_t cache_size = ((buf_end | 0x1F) + 1) - cache_start;
+    sys_cache_data_invd_range((void *)cache_start, cache_size);
+    #endif
+
     /* Stop timeout work */
     k_work_cancel_delayable(&data->rx_timeout_work);
 
@@ -843,14 +851,27 @@ static void uart_sam_isr(const struct device *dev)
     if (pending & UART_SR_RXRDY) {
         regs->UART_CR = UART_CR_RSTSTA;
 
-        if (data->async_cb) {
-            struct uart_event evt = {
-                .type = UART_RX_RDY,
-                .data.rx_stop.data.buf = data->rx_buf,
-                .data.rx_stop.data.len = data->rx_offset,
-            };
-            data->async_cb(dev, &evt, data->async_cb_data);
-        }
+		if (data->rx_next_len == 0U && data->async_cb) {
+			struct uart_event evt = {
+				.type = UART_RX_BUF_REQUEST,
+			};
+
+			data->async_cb(dev, &evt, data->async_cb_data);
+		}
+
+		/*
+		 * If we have a timeout, restart the time remaining whenever
+		 * we see data.
+		 */
+		if (data->rx_timeout_time != SYS_FOREVER_US) {
+			data->rx_timeout_from_isr = true;
+			data->rx_timeout_start = USEC_PER_MSEC * k_uptime_get_32();
+			k_work_reschedule(&data->rx_timeout_work,
+					      K_USEC(data->rx_timeout_chunk));
+		}
+
+		/* DMA will read the currently ready byte out */
+		dma_start(cfg->dma_dev, cfg->rx_dma_channel);
     }
 
     // Error handling
@@ -1003,8 +1024,8 @@ static int uart_sam_configure_rx_dma(const struct device *dev,
     }
 
     struct dma_block_config dma_blk = {
-        .source_address = (uint32_t)&regs->UART_RHR,
-        .dest_address = (uint32_t)buf,
+        .source_address = (uintptr_t)&regs->UART_RHR,
+        .dest_address = (uintptr_t)buf,
         .block_size = len,
         .source_addr_adj = DMA_ADDR_ADJ_NO_CHANGE,
         .dest_addr_adj = DMA_ADDR_ADJ_INCREMENT,
@@ -1018,6 +1039,7 @@ static int uart_sam_configure_rx_dma(const struct device *dev,
         .dest_burst_length = 1,
         .head_block = &dma_blk,
         .dma_callback = uart_sam_dma_rx_done,
+        .complete_callback_en = 1,
         .user_data = data,
         .dma_slot = cfg->rx_dma_request,
         .block_count = 1,
@@ -1108,7 +1130,8 @@ static int uart_sam_rx_enable(const struct device *dev, uint8_t *buf,
 
     /* Enable UART receiver and error interrupts */
     regs->UART_CR = UART_CR_RXEN;
-    regs->UART_IER = UART_SR_OVRE | UART_SR_FRAME | UART_SR_PARE | UART_IER_RXRDY;
+    regs->UART_IER = UART_SR_OVRE | UART_SR_FRAME | UART_SR_PARE;
+	regs->UART_IDR = UART_IDR_RXRDY;
 
     /* Configure DMA transfer */
     ret = uart_sam_configure_rx_dma(dev, buf, len);
