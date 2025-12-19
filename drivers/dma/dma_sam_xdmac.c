@@ -393,7 +393,7 @@ static int sam_xdmac_get_status(const struct device *dev, uint32_t channel,
 		status->dir = PERIPHERAL_TO_MEMORY;
 	}
 
-	status->busy = ((chan_cfg & XDMAC_CC_INITD_Msk) != 0) || (ublen > 0);
+	status->busy = (chan_cfg & XDMAC_CC_INITD_Msk) == 0;
 	status->pending_length = ublen;
 
 	return 0;

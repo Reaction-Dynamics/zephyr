@@ -454,9 +454,17 @@ static void uart_sam_rx_timeout(struct k_work *work)
         return;
     }
 
+    // If the dma is busy it means the channel is initializing then the pending length isn't reliable
+    // so reschedule this and check later
+    if (st.busy) {
+        k_work_reschedule(&dev_data->rx_timeout_work,
+                         K_USEC(dev_data->rx_inter_byte_timeout));
+        return;
+    }
+
     size_t current_position = dev_data->rx_len - st.pending_length;
 
-    /* Check if DMA position has advanced */
+    /* Check if DMA is initializing or position has advanced */
     if (current_position != dev_data->rx_last_position) {
         /* New data received - restart timeout */
         dev_data->rx_last_position = current_position;
@@ -489,10 +497,6 @@ static void uart_sam_rx_timeout(struct k_work *work)
      * k_work_submit marks work as busy until handler completes
      */
     k_work_submit(&event->work);
-
-    // Since we've captured a full packet set this high to get the next one
-    Uart *regs = cfg->regs;
-    regs->UART_IER = UART_IER_RXRDY;
 }
 
 #endif
@@ -1041,13 +1045,9 @@ static uint32_t get_dev_interbyte_timeout(const struct device *dev) {
     /* Calculate byte time in microseconds */
     uint32_t byte_time_us = (bits_per_byte * 1000000U) / config.baudrate;
 
-    /*
-    * Apply safety margin:
-    * - 5x for low/medium baud rates (< 115200)
-    * - 3x for high baud rates (>= 115200)
-    * This balances responsiveness vs robustness
-    */
-    uint32_t safety_multiplier = (config.baudrate >= 115200) ? 3 : 5;
+
+    // As per data sheet 46.5.2.2 start is dected 16 times the baud rate, so stop is also
+    uint32_t safety_multiplier = 16;
     uint32_t calculated_timeout = byte_time_us * safety_multiplier;
 
     /* Enforce reasonable bounds */
@@ -1121,8 +1121,8 @@ static int uart_sam_rx_enable(const struct device *dev, uint8_t *buf,
     }
 
     /* Enable UART receiver and error interrupts */
-    regs->UART_IER = UART_SR_OVRE | UART_SR_FRAME | UART_SR_PARE | UART_IER_RXRDY;
     regs->UART_CR = UART_CR_RSTSTA | UART_CR_RXEN;
+    regs->UART_IER = UART_SR_OVRE | UART_SR_FRAME | UART_SR_PARE | UART_IER_RXRDY;
 
     /*
      * Since we're using timeout-based packet detection, wait for RXRDY
@@ -1240,8 +1240,6 @@ static void uart_sam_rx_completion_handler(struct k_work *work)
 
     /* For timeout case, ensure DMA is stopped FIRST */
     if (event->reason == UART_SAM_RX_TIMEOUT) {
-        dma_stop(cfg->dma_dev, cfg->rx_dma_channel);
-
         /* CRITICAL: Add memory barrier to ensure DMA writes are visible */
         #ifdef CONFIG_DCACHE
         /* Ensure all pending DMA writes complete before reading status */
@@ -1250,6 +1248,7 @@ static void uart_sam_rx_completion_handler(struct k_work *work)
         #endif
     }
 
+    dma_stop(cfg->dma_dev, cfg->rx_dma_channel);
     /* NOW get the status after DMA is stopped */
     size_t bytes_received;
     ret = dma_get_status(cfg->dma_dev, cfg->rx_dma_channel, &st);
@@ -1328,6 +1327,7 @@ static void uart_sam_rx_completion_handler(struct k_work *work)
 
         /* Reset state for next packet */
         dev_data->rx_offset = 0;
+        dev_data->rx_last_position = 0;
 
         /* Reload DMA with new buffer */
         ret = dma_reload(cfg->dma_dev, cfg->rx_dma_channel,
@@ -1341,18 +1341,11 @@ static void uart_sam_rx_completion_handler(struct k_work *work)
             return;
         }
     }
+    else {
+        dev_data->rx_last_position = bytes_received;
+    }
 
-    dev_data->rx_last_position = 0;
-
-    /* Start reception for next packet */
-    /* ret = dma_start(cfg->dma_dev, cfg->rx_dma_channel); */
-    /* if (ret < 0) { */
-    /*     LOG_ERR("DMA start failed: %d", ret); */
-    /*     uart_sam_abort_rx(dev, UART_ERROR_OVERRUN); */
-    /*     irq_unlock(key); */
-    /*     return; */
-    /* } */
-
+    // Enable detection of the next incoming packet
     regs->UART_IER = UART_IER_RXRDY;
     irq_unlock(key);
 }
