@@ -133,7 +133,13 @@ static void uart_sam_notify_rx_data(const struct device *dev, size_t position)
         },
     };
 
-    data->rx_offset = position;
+    data->rx_offset += position;
+    if (data->rx_offset + position > data->rx_len) {
+        data->rx_offset = 0;
+    }
+    else {
+        data->rx_offset += position;
+    }
     data->async_cb(dev, &evt, data->async_cb_data);
 }
 
@@ -1260,6 +1266,7 @@ static void uart_sam_rx_completion_handler(struct k_work *work)
     }
 
     bytes_received = dev_data->rx_len - st.pending_length;
+    dev_data->rx_last_position = bytes_received;
 
     if (bytes_received == 0) {
         LOG_WRN("RX completion with no data");
@@ -1340,9 +1347,6 @@ static void uart_sam_rx_completion_handler(struct k_work *work)
             irq_unlock(key);
             return;
         }
-    }
-    else {
-        dev_data->rx_last_position = bytes_received;
     }
 
     // Enable detection of the next incoming packet
