@@ -117,12 +117,12 @@ static void uart_sam_notify_rx_data(const struct device *dev, size_t position)
         return;
     }
 
+    size_t new_bytes = position - data->rx_offset;
+
     /* Nothing new to report */
-    if (data->rx_offset >= position) {
+    if (new_bytes == 0) {
         return;
     }
-
-    size_t new_bytes = position - data->rx_offset;
 
     struct uart_event evt = {
         .type = UART_RX_RDY,
@@ -134,11 +134,8 @@ static void uart_sam_notify_rx_data(const struct device *dev, size_t position)
     };
 
     data->rx_offset += position;
-    if (data->rx_offset + position > data->rx_len) {
+    if (data->rx_offset + position >= data->rx_len) {
         data->rx_offset = 0;
-    }
-    else {
-        data->rx_offset += position;
     }
     data->async_cb(dev, &evt, data->async_cb_data);
 }
@@ -373,7 +370,7 @@ static void uart_sam_abort_rx(const struct device *dev, enum uart_rx_stop_reason
 }
 
 /* Allocate an RX event from the pool */
-static struct uart_sam_rx_event *uart_sam_alloc_rx_event(
+static inline struct uart_sam_rx_event *uart_sam_alloc_rx_event(
     struct uart_sam_dev_data *data)
 {
     for (int i = 0; i < ARRAY_SIZE(data->rx_event_pool); i++) {
@@ -779,7 +776,7 @@ static void uart_sam_isr(const struct device *dev)
         // Ensure that the RXRDY is enabled
         regs->UART_IER = UART_IER_RXRDY;
         struct uart_sam_rx_event *event = uart_sam_alloc_rx_event(data);
-        // TODO handle null event better
+        // FIXME handle null event better
         if (event == NULL) {
             return;
         }
@@ -1256,7 +1253,6 @@ static void uart_sam_rx_completion_handler(struct k_work *work)
 
     dma_stop(cfg->dma_dev, cfg->rx_dma_channel);
     /* NOW get the status after DMA is stopped */
-    size_t bytes_received;
     ret = dma_get_status(cfg->dma_dev, cfg->rx_dma_channel, &st);
     if (ret != 0) {
         LOG_ERR("Failed to get DMA status: %d", ret);
@@ -1265,10 +1261,9 @@ static void uart_sam_rx_completion_handler(struct k_work *work)
         return;
     }
 
-    bytes_received = dev_data->rx_len - st.pending_length;
-    dev_data->rx_last_position = bytes_received;
+    dev_data->rx_last_position = st.pending_length;
 
-    if (bytes_received == 0) {
+    if (st.pending_length == 0) {
         LOG_WRN("RX completion with no data");
 
         /* Restart DMA */
@@ -1293,7 +1288,7 @@ static void uart_sam_rx_completion_handler(struct k_work *work)
 
     /* Calculate cache-aligned region */
     uintptr_t buf_start = (uintptr_t)dev_data->rx_buf;
-    uintptr_t buf_end = buf_start + bytes_received;
+    uintptr_t buf_end = buf_start + st.pending_length;
 
     /* Align to cache line boundaries (32 bytes on Cortex-M7) */
     uintptr_t cache_start = buf_start & ~(CONFIG_DCACHE_LINE_SIZE - 1);
@@ -1313,7 +1308,7 @@ static void uart_sam_rx_completion_handler(struct k_work *work)
         dev_data->rx_len == st.pending_length;
 
     /* Notify application of received data */
-    uart_sam_notify_rx_data(dev, bytes_received);
+    uart_sam_notify_rx_data(dev, st.pending_length);
 
     /* Only release buffer if it's actually complete */
     if (buffer_complete) {
