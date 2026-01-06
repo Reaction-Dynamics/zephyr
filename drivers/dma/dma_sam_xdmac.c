@@ -322,6 +322,7 @@ int sam_xdmac_transfer_start(const struct device *dev, uint32_t channel)
 	return 0;
 }
 
+
 int sam_xdmac_transfer_stop(const struct device *dev, uint32_t channel)
 {
 	const struct sam_xdmac_dev_cfg *config = dev->config;
@@ -345,6 +346,72 @@ int sam_xdmac_transfer_stop(const struct device *dev, uint32_t channel)
 	xdmac->XDMAC_CHID[channel].XDMAC_CID = 0xFF;
 	/* Clear the pending Interrupt Status bit(s) */
 	(void)xdmac->XDMAC_CHID[channel].XDMAC_CIS;
+
+	return 0;
+}
+
+static int xdmac_suspend(const struct device *dev, uint32_t channel)
+{
+	const struct sam_xdmac_dev_cfg *config = dev->config;
+	struct sam_xdmac_dev_data *const dev_data = dev->data;
+
+	Xdmac * const xdmac = config->regs;
+
+	if (channel >= DMA_CHANNELS_NO) {
+		LOG_ERR("Channel %d out of range", channel);
+		return -EINVAL;
+	}
+
+	if (!(xdmac->XDMAC_GS & BIT(channel))) {
+		LOG_DBG("Channel %d not enabled", channel);
+		return -EINVAL;
+	}
+
+#if defined(CONFIG_SOC_SERIES_SAMX7X)
+	if (xdmac->XDMAC_GRS & BIT(channel) || xdmac->XDMAC_GWS & BIT(channel)) {
+#elif defined(CONFIG_SOC_SERIES_SAMA7G5)
+	if (xdmac->XDMAC_GRSS & BIT(channel) || xdmac->XDMAC_GWSS & BIT(channel)) {
+#else
+#error Unsupported SoC family
+#endif
+		LOG_DBG("Channel %d already suspended", channel);
+		return 0;
+	}
+
+	xdmac->XDMAC_GRWS |= BIT(channel);
+
+	return 0;
+}
+
+static int xdmac_resume(const struct device *dev, uint32_t channel)
+{
+	const struct sam_xdmac_dev_cfg *config = dev->config;
+	struct sam_xdmac_dev_data *const dev_data = dev->data;
+
+	Xdmac * const xdmac = config->regs;
+
+	if (channel >= DMA_CHANNELS_NO) {
+		LOG_ERR("Channel %d out of range", channel);
+		return -EINVAL;
+	}
+
+	if (!(xdmac->XDMAC_GS & BIT(channel))) {
+		LOG_DBG("Channel %d not enabled", channel);
+		return -EINVAL;
+	}
+
+#if defined(CONFIG_SOC_SERIES_SAMX7X)
+	if (!(xdmac->XDMAC_GRS & BIT(channel) || xdmac->XDMAC_GWS & BIT(channel))) {
+#elif defined(CONFIG_SOC_SERIES_SAMA7G5)
+	if (!(xdmac->XDMAC_GRSS & BIT(channel) || xdmac->XDMAC_GWSS & BIT(channel))) {
+#else
+#error Unsupported SoC family
+#endif
+		LOG_DBG("Channel %d not suspended", channel);
+		return 0;
+	}
+
+	xdmac->XDMAC_GRWR |= BIT(channel);
 
 	return 0;
 }
@@ -404,6 +471,8 @@ static DEVICE_API(dma, sam_xdmac_driver_api) = {
 	.reload = sam_xdmac_transfer_reload,
 	.start = sam_xdmac_transfer_start,
 	.stop = sam_xdmac_transfer_stop,
+	.resume = xdmac_resume,
+	.suspend = xdmac_suspend,
 	.get_status = sam_xdmac_get_status,
 };
 
