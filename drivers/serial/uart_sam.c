@@ -79,8 +79,8 @@ struct uart_sam_dev_data {
     /* RX */
     uint8_t *rx_buf;
     size_t rx_len;
-    size_t rx_bytes_received;  /* Current position in buffer */
-    size_t rx_bytes_emitted;  /* Current position in buffer */
+    size_t rx_holding_buffer_length;  /* The number of bytes transfered by the dma from the holding register to our rx buff */
+    size_t rx_bytes_emitted;  /* The number of bytes propagated from the rx buff to the user */
     uint8_t *rx_next_buf;
     size_t rx_next_len;
     /* RX timeout configuration */
@@ -275,7 +275,7 @@ static void uart_sam_abort_rx(const struct device *dev, enum uart_rx_stop_reason
             .type = UART_RX_STOPPED,
             .data.rx_stop = {
                 .reason = reason,
-                .data.len = data->rx_bytes_received,
+                .data.len = data->rx_holding_buffer_length,
                 .data.buf = data->rx_buf,
             },
         };
@@ -285,7 +285,7 @@ static void uart_sam_abort_rx(const struct device *dev, enum uart_rx_stop_reason
     data->rx_enabled = false;
     data->rx_buf = NULL;
     data->rx_len = 0U;
-    data->rx_bytes_received = 0U;
+    data->rx_holding_buffer_length = 0U;
     data->rx_bytes_emitted = 0U;
 }
 
@@ -326,7 +326,7 @@ static void uart_sam_dma_rx_done(const struct device *dma_dev, void *arg,
     struct uart_sam_rx_event *event = uart_sam_alloc_rx_event(data);
     if (!event) {
         LOG_ERR("Cannot allocate RX event in DMA callback");
-        // TODO provide better error propagation
+        // FIXME provide better error propagation
         error_code = -1;
         return;
     }
@@ -412,9 +412,9 @@ static void uart_sam_rx_timeout(struct k_work *work)
     }
 
     /* Check if position has advanced */
-    if (dev_data->rx_bytes_received != dev_data->rx_len - st.pending_length && st.pending_length != dev_data->rx_len) {
+    if (dev_data->rx_holding_buffer_length != dev_data->rx_len - st.pending_length && st.pending_length != dev_data->rx_len) {
         /* New data received - restart timeout */
-        dev_data->rx_bytes_received = dev_data->rx_len - st.pending_length;
+        dev_data->rx_holding_buffer_length = dev_data->rx_len - st.pending_length;
         k_work_reschedule(&dev_data->rx_timeout_work,
                          K_USEC(dev_data->rx_inter_byte_timeout));
         return;
@@ -428,6 +428,9 @@ static void uart_sam_rx_timeout(struct k_work *work)
                          K_USEC(dev_data->rx_inter_byte_timeout));
         return;
     }
+
+    /* Cancel timeout work - we're handling completion now */
+    k_work_cancel_delayable(&dev_data->rx_timeout_work);
 
     event->dev = dev;
     event->reason = UART_SAM_RX_TIMEOUT;
@@ -736,7 +739,7 @@ static void uart_sam_isr(const struct device *dev)
             /* Disable RXRDY - only needed for packet start detection */
             regs->UART_IDR = UART_IDR_RXRDY;
 
-            int ret = dma_start(cfg->dma_dev, cfg->rx_dma_channel);
+            int ret = dma_resume(cfg->dma_dev, cfg->rx_dma_channel);
             if (ret < 0) {
                 struct uart_sam_rx_event *event = uart_sam_alloc_rx_event(data);
                 if (event == NULL) {
@@ -1035,7 +1038,7 @@ static int uart_sam_rx_enable(const struct device *dev, uint8_t *buf,
     /* Initialize RX state */
     data->rx_buf = buf;
     data->rx_len = len - 1;
-    data->rx_bytes_received = 0U;
+    data->rx_holding_buffer_length = 0U;
     data->rx_bytes_emitted = 0U;
     data->rx_enabled = true;
 
@@ -1051,13 +1054,18 @@ static int uart_sam_rx_enable(const struct device *dev, uint8_t *buf,
     regs->UART_CR = UART_CR_RSTSTA | UART_CR_RXEN;
     regs->UART_IER = UART_SR_OVRE | UART_SR_FRAME | UART_SR_PARE | UART_IER_RXRDY;
 
+    ret = dma_start(cfg->dma_dev, cfg->rx_dma_channel);
+    if (ret != 0) {
+        goto error_cleanup;
+    }
+
     irq_unlock(key);
     return 0;
 
 error_cleanup:
     data->rx_buf = NULL;
     data->rx_len = 0U;
-    data->rx_bytes_received = 0U;
+    data->rx_holding_buffer_length = 0U;
     data->rx_bytes_emitted = 0U;
     data->rx_enabled = false;
     regs->UART_CR = UART_CR_RXDIS;
@@ -1108,7 +1116,7 @@ static int uart_sam_rx_disable(const struct device *dev)
 
     data->rx_buf = NULL;
     data->rx_len = 0U;
-    data->rx_bytes_received = 0U;
+    data->rx_holding_buffer_length = 0U;
     data->rx_bytes_emitted = 0U;
     data->rx_enabled = false;
 
@@ -1155,7 +1163,7 @@ static inline int uart_sam_switch_to_next_rx_buffer(const struct device *dev)
     /* Clear current buffer state */
     data->rx_buf = NULL;
     data->rx_len = 0;
-    data->rx_bytes_received = 0;
+    data->rx_holding_buffer_length = 0;
     data->rx_bytes_emitted = 0U;
 
     /* Request new buffer */
@@ -1279,7 +1287,7 @@ static void uart_sam_rx_completion_handler(struct k_work *work)
             __DSB();  /* Data Synchronization Barrier */
             __ISB();  /* Instruction Synchronization Barrier */
 #endif
-            dma_stop(cfg->dma_dev, cfg->rx_dma_channel);
+            dma_suspend(cfg->dma_dev, cfg->rx_dma_channel);
             __DSB();  /* Data Synchronization Barrier */
 
             ret = uart_sam_wait_dma_stopped(dev, K_MSEC(10));
@@ -1298,7 +1306,7 @@ static void uart_sam_rx_completion_handler(struct k_work *work)
         }
 
         // Make sure this is up to date
-        dev_data->rx_bytes_received = dev_data->rx_len - dma_st.pending_length;
+        dev_data->rx_holding_buffer_length = dev_data->rx_len - dma_st.pending_length;
 #ifdef CONFIG_DCACHE
         /*
         * CRITICAL CACHE INVALIDATION
@@ -1308,7 +1316,7 @@ static void uart_sam_rx_completion_handler(struct k_work *work)
         __DSB();
         /* Calculate cache-aligned region */
         uintptr_t buf_start = (uintptr_t)dev_data->rx_buf;
-        uintptr_t buf_end = buf_start + dev_data->rx_bytes_received;
+        uintptr_t buf_end = buf_start + dev_data->rx_holding_buffer_length;
 
         /* Align to cache line boundaries (32 bytes on Cortex-M7) */
         uintptr_t cache_start = buf_start & ~(CONFIG_DCACHE_LINE_SIZE - 1);
@@ -1323,7 +1331,7 @@ static void uart_sam_rx_completion_handler(struct k_work *work)
         __ISB();
 #endif
 
-        size_t new_bytes = dev_data->rx_bytes_received - dev_data->rx_bytes_emitted;
+        size_t new_bytes = dev_data->rx_holding_buffer_length - dev_data->rx_bytes_emitted;
         if (new_bytes == 0) {
             break;
         }
