@@ -79,12 +79,12 @@ struct uart_sam_dev_data {
     /* RX */
     uint8_t *rx_buf;
     size_t rx_len;
-    size_t rx_offset;  /* Current position in buffer */
+    size_t rx_bytes_received;  /* Current position in buffer */
+    size_t rx_bytes_emitted;  /* Current position in buffer */
     uint8_t *rx_next_buf;
     size_t rx_next_len;
     /* RX timeout configuration */
     uint32_t rx_inter_byte_timeout;  // Microseconds of silence = packet done
-    size_t rx_last_position;         // Last known DMA position
     /* Work items */
     struct k_work_delayable rx_timeout_work;
     /* Event pool for RX completion events */
@@ -102,44 +102,6 @@ struct uart_sam_dev_data {
     void *async_cb_data;
 #endif
 };
-
-/**
- * Notify application of RX data up to the specified position
- * Only notifies data that hasn't been reported yet (beyond rx_offset)
- *
- * @param dev Device instance
- * @param position Absolute position in buffer (total bytes received)
- */
-static void uart_sam_notify_rx_data(const struct device *dev, size_t position)
-{
-    struct uart_sam_dev_data *data = dev->data;
-
-    if (!data->async_cb) {
-        return;
-    }
-
-    size_t new_bytes = position - data->rx_offset;
-
-    /* Nothing new to report */
-    if (new_bytes == 0) {
-        return;
-    }
-
-    struct uart_event evt = {
-        .type = UART_RX_RDY,
-        .data.rx = {
-            .buf = data->rx_buf,
-            .offset = data->rx_offset,
-            .len = new_bytes,
-        },
-    };
-
-    data->rx_offset += position;
-    if (data->rx_offset + position >= data->rx_len) {
-        data->rx_offset = 0;
-    }
-    data->async_cb(dev, &evt, data->async_cb_data);
-}
 
 static int uart_sam_poll_in(const struct device *dev, unsigned char *c)
 {
@@ -313,7 +275,7 @@ static void uart_sam_abort_rx(const struct device *dev, enum uart_rx_stop_reason
             .type = UART_RX_STOPPED,
             .data.rx_stop = {
                 .reason = reason,
-                .data.len = data->rx_offset,
+                .data.len = data->rx_bytes_received,
                 .data.buf = data->rx_buf,
             },
         };
@@ -323,7 +285,8 @@ static void uart_sam_abort_rx(const struct device *dev, enum uart_rx_stop_reason
     data->rx_enabled = false;
     data->rx_buf = NULL;
     data->rx_len = 0U;
-    data->rx_offset = 0U;
+    data->rx_bytes_received = 0U;
+    data->rx_bytes_emitted = 0U;
 }
 
 /* Allocate an RX event from the pool */
@@ -410,18 +373,6 @@ static void uart_sam_rx_timeout(struct k_work *work)
         return;
     }
 
-    /* /\* Validate direction *\/ */
-    /* if (st.dir != PERIPHERAL_TO_MEMORY) { */
-    /*     LOG_ERR("DMA direction wrong: %d", st.dir); */
-    /*     struct uart_sam_rx_event *event = uart_sam_alloc_rx_event(dev_data); */
-    /*     if (event) { */
-    /*         event->dev = dev; */
-    /*         event->reason = UART_SAM_RX_DMA_ERROR; */
-    /*         event->error_code = -EINVAL; */
-    /*         k_work_submit(&event->work); */
-    /*     } */
-    /*     return; */
-    /* } */
 
     /* If DMA is busy, position may be unreliable during transition */
     if (st.busy) {
@@ -444,6 +395,19 @@ static void uart_sam_rx_timeout(struct k_work *work)
         return;
     }
 
+    /* Validate direction */
+    if (st.dir != PERIPHERAL_TO_MEMORY) {
+        LOG_ERR("DMA direction wrong: %d", st.dir);
+        struct uart_sam_rx_event *event = uart_sam_alloc_rx_event(dev_data);
+        if (event) {
+            event->dev = dev;
+            event->reason = UART_SAM_RX_DMA_ERROR;
+            event->error_code = -EINVAL;
+            k_work_submit(&event->work);
+        }
+        return;
+    }
+
     /* Reset retry counter */
     dev_data->rx_timeout_retries = 0;
 
@@ -462,9 +426,9 @@ static void uart_sam_rx_timeout(struct k_work *work)
     }
 
     /* Check if position has advanced */
-    if (st.pending_length != dev_data->rx_last_position && st.pending_length != 0) {
+    if (dev_data->rx_bytes_received != dev_data->rx_len - st.pending_length && st.pending_length != dev_data->rx_len) {
         /* New data received - restart timeout */
-        dev_data->rx_last_position = st.pending_length;
+        dev_data->rx_bytes_received = dev_data->rx_len - st.pending_length;
         k_work_reschedule(&dev_data->rx_timeout_work,
                          K_USEC(dev_data->rx_inter_byte_timeout));
         return;
@@ -1085,8 +1049,8 @@ static int uart_sam_rx_enable(const struct device *dev, uint8_t *buf,
     /* Initialize RX state */
     data->rx_buf = buf;
     data->rx_len = len - 1;
-    data->rx_offset = 0U;
-    data->rx_last_position = 0U;
+    data->rx_bytes_received = 0U;
+    data->rx_bytes_emitted = 0U;
     data->rx_enabled = true;
 
     data->rx_inter_byte_timeout = get_dev_interbyte_timeout(dev);
@@ -1094,15 +1058,6 @@ static int uart_sam_rx_enable(const struct device *dev, uint8_t *buf,
     /* Configure DMA transfer */
     ret = uart_sam_configure_rx_dma(dev, data->rx_buf, data->rx_len);
     if (ret != 0) {
-        goto error_cleanup;
-    }
-
-    // NOTE this reload might be redundant after coonfiguring it
-    ret = dma_reload(cfg->dma_dev, cfg->rx_dma_channel,
-                    (uintptr_t)(&regs->UART_RHR),
-                    (uintptr_t)data->rx_buf, data->rx_len);
-    if (ret < 0) {
-        LOG_ERR("DMA reload failed: %d", ret);
         goto error_cleanup;
     }
 
@@ -1116,7 +1071,8 @@ static int uart_sam_rx_enable(const struct device *dev, uint8_t *buf,
 error_cleanup:
     data->rx_buf = NULL;
     data->rx_len = 0U;
-    data->rx_offset = 0U;
+    data->rx_bytes_received = 0U;
+    data->rx_bytes_emitted = 0U;
     data->rx_enabled = false;
     regs->UART_CR = UART_CR_RXDIS;
     regs->UART_IDR = UART_SR_OVRE | UART_SR_FRAME | UART_SR_PARE;
@@ -1166,7 +1122,8 @@ static int uart_sam_rx_disable(const struct device *dev)
 
     data->rx_buf = NULL;
     data->rx_len = 0U;
-    data->rx_offset = 0U;
+    data->rx_bytes_received = 0U;
+    data->rx_bytes_emitted = 0U;
     data->rx_enabled = false;
 
     if (!data->async_cb) {
@@ -1212,7 +1169,8 @@ static inline int uart_sam_switch_to_next_rx_buffer(const struct device *dev)
     /* Clear current buffer state */
     data->rx_buf = NULL;
     data->rx_len = 0;
-    data->rx_offset = 0;
+    data->rx_bytes_received = 0;
+    data->rx_bytes_emitted = 0U;
 
     /* Request new buffer */
     evt.type = UART_RX_BUF_REQUEST;
@@ -1229,7 +1187,6 @@ static inline int uart_sam_switch_to_next_rx_buffer(const struct device *dev)
     data->rx_len = data->rx_next_len;
     data->rx_next_buf = NULL;
     data->rx_next_len = 0;
-    data->rx_last_position = 0;
 
     Uart *regs = cfg->regs;
 
@@ -1268,19 +1225,24 @@ static int uart_sam_wait_dma_stopped(const struct device *dev, k_timeout_t timeo
     const struct uart_sam_dev_cfg *cfg = dev->config;
     struct dma_status st;
     uint64_t end_time = k_uptime_get() + timeout.ticks;
+    if (dma_get_status(cfg->dma_dev, cfg->rx_dma_channel, &st) != 0) {
+        return -EIO;
+    }
+    uint32_t initial_pending = st.pending_length;
 
     do {
+        k_sleep(K_USEC(10));
+
         if (dma_get_status(cfg->dma_dev, cfg->rx_dma_channel, &st) != 0) {
             return -EIO;
         }
 
-        if (!st.busy) {
+        if (!st.busy && initial_pending == st.pending_length) {
             /* Add barrier to ensure no pending writes */
             __DSB();
             return 0;
         }
-
-        k_sleep(K_USEC(10));
+        initial_pending = st.pending_length;
     } while (k_uptime_get() < end_time);
 
     return -ETIMEDOUT;
@@ -1322,6 +1284,9 @@ static void uart_sam_rx_completion_handler(struct k_work *work)
         return;
     }
 
+    // Temporarily disable the receiver and wait for dma to stop, then get process it
+    regs->UART_CR = UART_CR_RXDIS;
+    __DSB();
     /* For timeout case, ensure DMA is stopped FIRST */
     if (event->reason == UART_SAM_RX_TIMEOUT) {
         /* CRITICAL: Add memory barrier to ensure DMA writes are visible */
@@ -1330,19 +1295,18 @@ static void uart_sam_rx_completion_handler(struct k_work *work)
         __DSB();  /* Data Synchronization Barrier */
         __ISB();  /* Instruction Synchronization Barrier */
         #endif
+        dma_stop(cfg->dma_dev, cfg->rx_dma_channel);
+        __DSB();  /* Data Synchronization Barrier */
+
+        ret = uart_sam_wait_dma_stopped(dev, K_MSEC(10));
+        if (ret != 0) {
+            LOG_ERR("DMA failed to stop: %d", ret);
+            uart_sam_abort_rx(dev, UART_ERROR_OVERRUN);
+            irq_unlock(key);
+            return;
+        }
     }
 
-    // Temporarily disable the receiver and wait for dma to stop, then get process it
-    regs->UART_CR = UART_CR_RXDIS;
-    __DSB();
-    dma_stop(cfg->dma_dev, cfg->rx_dma_channel);
-    ret = uart_sam_wait_dma_stopped(dev, K_MSEC(10));
-    if (ret != 0) {
-        LOG_ERR("DMA failed to stop: %d", ret);
-        uart_sam_abort_rx(dev, UART_ERROR_OVERRUN);
-        irq_unlock(key);
-        return;
-    }
     ret = dma_get_status(cfg->dma_dev, cfg->rx_dma_channel, &dma_st);
     if (ret != 0) {
         LOG_ERR("Failed to get DMA status: %d", ret);
@@ -1351,27 +1315,18 @@ static void uart_sam_rx_completion_handler(struct k_work *work)
         return;
     }
 
-    dev_data->rx_last_position = dma_st.pending_length;
-
-    if (dma_st.pending_length == 0) {
-        LOG_ERR("Invalid pending length: %d", dma_st.pending_length);
-        uart_sam_abort_rx(dev, UART_ERROR_OVERRUN);
-        irq_unlock(key);
-        return;
-    }
-
+    // Make sure this is up to date
+    dev_data->rx_bytes_received = dev_data->rx_len - dma_st.pending_length;
     #ifdef CONFIG_DCACHE
     /*
      * CRITICAL CACHE INVALIDATION
      * Must invalidate AFTER DMA stops and BEFORE reading buffer
      */
 
-    /* Ensure DMA writes are complete */
     __DSB();
-
     /* Calculate cache-aligned region */
     uintptr_t buf_start = (uintptr_t)dev_data->rx_buf;
-    uintptr_t buf_end = buf_start + dma_st.pending_length;
+    uintptr_t buf_end = buf_start + dev_data->rx_bytes_received;
 
     /* Align to cache line boundaries (32 bytes on Cortex-M7) */
     uintptr_t cache_start = buf_start & ~(CONFIG_DCACHE_LINE_SIZE - 1);
@@ -1386,27 +1341,39 @@ static void uart_sam_rx_completion_handler(struct k_work *work)
     __ISB();
     #endif
 
-    /* Notify application of received data */
-    uart_sam_notify_rx_data(dev, dma_st.pending_length);
+    size_t new_bytes = dev_data->rx_bytes_received - dev_data->rx_bytes_emitted;
+    if (new_bytes != 0) {
 
-    /* Only release buffer if it's actually complete */
-    if (event->reason == UART_SAM_RX_BUFFER_FULL || dev_data->rx_len == dma_st.pending_length) {
-        /* Switch to next buffer */
-        ret = uart_sam_switch_to_next_rx_buffer(dev);
+        /* Notify application of received data */
+        struct uart_event evt = {
+            .type = UART_RX_RDY,
+            .data.rx = {
+                .buf = dev_data->rx_buf,
+                .offset = dev_data->rx_bytes_emitted,
+                .len = new_bytes,
+            },
+        };
+        dev_data->async_cb(dev, &evt, dev_data->async_cb_data);
+        dev_data->rx_bytes_emitted += new_bytes;
 
-        if (ret < 0) {
-            LOG_ERR("DMA reload failed: %d", ret);
-            uart_sam_abort_rx(dev, UART_ERROR_OVERRUN);
-            irq_unlock(key);
-            return;
+        /* Only release buffer if it's actually complete */
+        if (event->reason == UART_SAM_RX_BUFFER_FULL || dev_data->rx_bytes_received >= dev_data->rx_len) {
+            /* Switch to next buffer */
+            ret = uart_sam_switch_to_next_rx_buffer(dev);
+
+            if (ret < 0) {
+                LOG_ERR("DMA reload failed: %d", ret);
+                uart_sam_abort_rx(dev, UART_ERROR_OVERRUN);
+                irq_unlock(key);
+                return;
+            }
         }
     }
-
+    // Enable detection of the next incoming packet
+    regs->UART_IER = UART_IER_RXRDY;
     // re-enable the receiver
     regs->UART_CR = UART_CR_RXEN;
     __DSB();
-    // Enable detection of the next incoming packet
-    regs->UART_IER = UART_IER_RXRDY;
     irq_unlock(key);
 }
 
