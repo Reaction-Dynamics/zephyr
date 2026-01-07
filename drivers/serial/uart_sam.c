@@ -49,18 +49,19 @@ struct uart_sam_dev_cfg {
 };
 
 /* RX completion reasons */
-enum uart_sam_rx_completion_reason {
+enum UART_SAM_COMPLETION_REASON {
     UART_SAM_RX_TIMEOUT,      /* Inter-byte timeout - packet complete */
     UART_SAM_RX_BUFFER_FULL,  /* DMA buffer full */
-    UART_SAM_RX_DMA_ERROR,        /* DMA error occurred */
+    UART_SAM_DMA_ERROR,        /* DMA error occurred */
     UART_SAM_RX_SR_ERROR,        /* DMA error occurred */
+    UART_SAM_TX_CLEANUP,        /* DMA error occurred */
 };
 
 /* RX completion event - self-contained work item */
-struct uart_sam_rx_event {
+struct uart_sam_work_event {
     struct k_work work;                           /* Must be first for CONTAINER_OF */
     const struct device *dev;                     /* Device reference */
-    enum uart_sam_rx_completion_reason reason;    /* Why we're completing */
+    enum UART_SAM_COMPLETION_REASON reason;    /* Why we're completing */
     int error_code;                               /* DMA error code if applicable */
 };
 
@@ -88,7 +89,7 @@ struct uart_sam_dev_data {
     /* Work items */
     struct k_work_delayable rx_timeout_work;
     /* Event pool for RX completion events */
-    struct uart_sam_rx_event rx_event_pool[5];   /* DMA done, timeout, spare */
+    struct uart_sam_work_event event_pool[5];   /* DMA done, timeout, spare */
 
     bool rx_enabled;
 
@@ -186,6 +187,26 @@ static int uart_sam_baudrate_set(const struct device *dev, uint32_t baudrate)
 
 #if CONFIG_UART_SAM_ASYNC
 
+/* Allocate an RX event from the pool */
+static inline struct uart_sam_work_event *uart_sam_alloc_rx_event(
+    struct uart_sam_dev_data *data)
+{
+    for (int i = 0; i < ARRAY_SIZE(data->event_pool); i++) {
+        struct uart_sam_work_event *event = &data->event_pool[i];
+
+        /* Check if this work item is idle (not queued/running) */
+        if (k_work_busy_get(&event->work) == 0) {
+            /* This slot is free - claim it */
+            return event;
+        }
+    }
+
+    /* Pool exhausted - this shouldn't happen with proper sizing */
+    LOG_ERR("RX event pool exhausted!");
+    return NULL;
+}
+
+
 // DMA callback - triggered when DMA finishes writing to UART_THR
 static void uart_sam_dma_tx_done(const struct device *dma_dev, void *arg,
                                  uint32_t id, int error_code)
@@ -196,21 +217,32 @@ static void uart_sam_dma_tx_done(const struct device *dma_dev, void *arg,
     struct uart_sam_dev_data *const dev_data =
         (struct uart_sam_dev_data *const)arg;
     const struct device *dev = dev_data->dev;
+    const struct uart_sam_dev_cfg *cfg = dev->config;
+    // Suspend the dma until it can be resumed by the work queue
+    dma_suspend(cfg->dma_dev, cfg->tx_dma_channel);
+    __DSB();  /* Data Synchronization Barrier */
 
-    struct uart_event evt = {
-        .type = UART_TX_DONE,
-        .data.tx = {
-            .buf = dev_data->tx_buf,
-            .len = dev_data->tx_len,
-        },
-    };
-
-    if (evt.data.tx.len != 0U && dev_data->async_cb) {
-        dev_data->async_cb(dev, &evt, dev_data->async_cb_data);
+    /* Allocate event from pool */
+    struct uart_sam_work_event *event = uart_sam_alloc_rx_event(dev_data);
+    if (!event) {
+        // FIXME provide better error propagation
+        error_code = -1;
+        return;
     }
 
-    dev_data->tx_buf = NULL;
-    dev_data->tx_len = 0U;
+    /* Populate event */
+    event->dev = dev;
+    event->error_code = error_code;
+
+    if (error_code < 0) {
+        /* DMA error */
+        event->reason = UART_SAM_DMA_ERROR;
+    } else {
+        /* DMA completed successfully = buffer full */
+        event->reason = UART_SAM_TX_CLEANUP;
+    }
+
+    k_work_submit(&event->work);
 }
 
 static int uart_sam_tx_halt(struct uart_sam_dev_data *dev_data)
@@ -289,25 +321,6 @@ static void uart_sam_abort_rx(const struct device *dev, enum uart_rx_stop_reason
     data->rx_bytes_emitted = 0U;
 }
 
-/* Allocate an RX event from the pool */
-static inline struct uart_sam_rx_event *uart_sam_alloc_rx_event(
-    struct uart_sam_dev_data *data)
-{
-    for (int i = 0; i < ARRAY_SIZE(data->rx_event_pool); i++) {
-        struct uart_sam_rx_event *event = &data->rx_event_pool[i];
-
-        /* Check if this work item is idle (not queued/running) */
-        if (k_work_busy_get(&event->work) == 0) {
-            /* This slot is free - claim it */
-            return event;
-        }
-    }
-
-    /* Pool exhausted - this shouldn't happen with proper sizing */
-    LOG_ERR("RX event pool exhausted!");
-    return NULL;
-}
-
 static void uart_sam_dma_rx_done(const struct device *dma_dev, void *arg,
                   uint32_t id, int error_code)
 {
@@ -323,7 +336,7 @@ static void uart_sam_dma_rx_done(const struct device *dma_dev, void *arg,
     }
 
     /* Allocate event from pool */
-    struct uart_sam_rx_event *event = uart_sam_alloc_rx_event(data);
+    struct uart_sam_work_event *event = uart_sam_alloc_rx_event(data);
     if (!event) {
         LOG_ERR("Cannot allocate RX event in DMA callback");
         // FIXME provide better error propagation
@@ -337,7 +350,7 @@ static void uart_sam_dma_rx_done(const struct device *dma_dev, void *arg,
 
     if (error_code < 0) {
         /* DMA error */
-        event->reason = UART_SAM_RX_DMA_ERROR;
+        event->reason = UART_SAM_DMA_ERROR;
     } else {
         /* DMA completed successfully = buffer full */
         event->reason = UART_SAM_RX_BUFFER_FULL;
@@ -378,10 +391,10 @@ static void uart_sam_rx_timeout(struct k_work *work)
         /* Check if we've been waiting too long */
         if (dev_data->rx_timeout_retries++ > 10) {
             LOG_ERR("DMA stuck in busy state");
-            struct uart_sam_rx_event *event = uart_sam_alloc_rx_event(dev_data);
+            struct uart_sam_work_event *event = uart_sam_alloc_rx_event(dev_data);
             if (event) {
                 event->dev = dev;
-                event->reason = UART_SAM_RX_DMA_ERROR;
+                event->reason = UART_SAM_DMA_ERROR;
                 event->error_code = -ETIMEDOUT;
                 k_work_submit(&event->work);
             }
@@ -401,10 +414,10 @@ static void uart_sam_rx_timeout(struct k_work *work)
     if (st.pending_length > dev_data->rx_len) {
         LOG_ERR("Invalid pending length: %u > %u",
                 st.pending_length, dev_data->rx_len);
-        struct uart_sam_rx_event *event = uart_sam_alloc_rx_event(dev_data);
+        struct uart_sam_work_event *event = uart_sam_alloc_rx_event(dev_data);
         if (event) {
             event->dev = dev;
-            event->reason = UART_SAM_RX_DMA_ERROR;
+            event->reason = UART_SAM_DMA_ERROR;
             event->error_code = -EOVERFLOW;
             k_work_submit(&event->work);
         }
@@ -421,7 +434,7 @@ static void uart_sam_rx_timeout(struct k_work *work)
     }
 
     /* Position unchanged - idle detected, packet complete */
-    struct uart_sam_rx_event *event = uart_sam_alloc_rx_event(dev_data);
+    struct uart_sam_work_event *event = uart_sam_alloc_rx_event(dev_data);
     if (!event) {
         LOG_ERR("Cannot allocate RX event in timeout");
         k_work_reschedule(&dev_data->rx_timeout_work,
@@ -711,7 +724,7 @@ static void uart_sam_isr(const struct device *dev)
         regs->UART_CR = UART_CR_RSTSTA;
         // Ensure that the RXRDY is enabled
         regs->UART_IER = UART_IER_RXRDY;
-        struct uart_sam_rx_event *event = uart_sam_alloc_rx_event(data);
+        struct uart_sam_work_event *event = uart_sam_alloc_rx_event(data);
         // FIXME handle null event better
         if (event == NULL) {
             return;
@@ -741,7 +754,7 @@ static void uart_sam_isr(const struct device *dev)
 
             int ret = dma_resume(cfg->dma_dev, cfg->rx_dma_channel);
             if (ret < 0) {
-                struct uart_sam_rx_event *event = uart_sam_alloc_rx_event(data);
+                struct uart_sam_work_event *event = uart_sam_alloc_rx_event(data);
                 if (event == NULL) {
                     return;
                 }
@@ -1248,10 +1261,10 @@ static inline int uart_sam_switch_to_next_rx_buffer(const struct device *dev)
     return ret;
 }
 
-static void uart_sam_rx_completion_handler(struct k_work *work)
+static void uart_sam_completion_handler(struct k_work *work)
 {
-    struct uart_sam_rx_event *event = CONTAINER_OF(work,
-                                                    struct uart_sam_rx_event,
+    struct uart_sam_work_event *event = CONTAINER_OF(work,
+                                                    struct uart_sam_work_event,
                                                     work);
     const struct device *dev = event->dev;
     const struct uart_sam_dev_cfg *cfg = dev->config;
@@ -1269,8 +1282,8 @@ static void uart_sam_rx_completion_handler(struct k_work *work)
         }
 
         /* Handle error case first - different flow */
-        // /* TODO refactor with a switch case on reason
-        if (event->reason == UART_SAM_RX_DMA_ERROR) {
+        // TODO refactor with a switch case on reason
+        if (event->reason == UART_SAM_DMA_ERROR) {
             LOG_ERR("RX DMA error: %d", event->error_code);
             uart_sam_abort_rx(dev, UART_ERROR_OVERRUN);
             break;
@@ -1279,6 +1292,28 @@ static void uart_sam_rx_completion_handler(struct k_work *work)
         if (event->reason == UART_SAM_RX_SR_ERROR) {
             LOG_ERR("RX SR error: %d", event->error_code);
             uart_sam_abort_rx(dev, event->error_code);
+            break;
+        }
+
+        if (event->reason == UART_SAM_TX_CLEANUP) {
+            regs->UART_CR = UART_CR_TXDIS;
+
+            struct uart_event evt = {
+                .type = UART_TX_DONE,
+                .data.tx = {
+                    .buf = dev_data->tx_buf,
+                    .len = dev_data->tx_len,
+                },
+            };
+
+            if (evt.data.tx.len != 0U && dev_data->async_cb) {
+                dev_data->async_cb(dev, &evt, dev_data->async_cb_data);
+            }
+
+            dev_data->tx_buf = NULL;
+            dev_data->tx_len = 0U;
+
+            dma_resume(cfg->dma_dev, cfg->tx_dma_channel);
             break;
         }
 
@@ -1367,10 +1402,16 @@ static void uart_sam_rx_completion_handler(struct k_work *work)
         }
     } while(0);
 
-    // Enable detection of the next incoming packet
-    regs->UART_IER = UART_IER_RXRDY;
-    // re-enable the receiver
-    regs->UART_CR = UART_CR_RXEN;
+    if (event->reason == UART_SAM_TX_CLEANUP) {
+        // re-enable the transmitter
+        regs->UART_CR = UART_CR_TXEN;
+    }
+    else {
+        // Enable detection of the next incoming packet
+        regs->UART_IER = UART_IER_RXRDY;
+        // re-enable the receiver
+        regs->UART_CR = UART_CR_RXEN;
+    }
     __DSB();
     irq_unlock(key);
 }
@@ -1413,10 +1454,10 @@ static int uart_sam_init(const struct device *dev)
     dev_data->rx_timeout_retries = 0;
 
     /* Initialize event pool - all work items start idle */
-    for (int i = 0; i < ARRAY_SIZE(dev_data->rx_event_pool); i++) {
-        k_work_init(&dev_data->rx_event_pool[i].work,
-                   uart_sam_rx_completion_handler);
-        dev_data->rx_event_pool[i].dev = dev;
+    for (int i = 0; i < ARRAY_SIZE(dev_data->event_pool); i++) {
+        k_work_init(&dev_data->event_pool[i].work,
+                   uart_sam_completion_handler);
+        dev_data->event_pool[i].dev = dev;
     }
 
     k_work_init_delayable(&dev_data->tx_timeout_work, uart_sam_tx_timeout);
