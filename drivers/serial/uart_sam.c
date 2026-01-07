@@ -1201,7 +1201,6 @@ static inline int uart_sam_switch_to_next_rx_buffer(const struct device *dev)
     struct uart_event evt = {
         .type = UART_RX_BUF_RELEASED,
         .data.rx_buf.buf = data->rx_buf,
-        .data.rx.len = data->rx_len,
     };
     data->async_cb(dev, &evt, data->async_cb_data);
 
