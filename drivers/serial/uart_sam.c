@@ -412,7 +412,7 @@ static void uart_sam_rx_timeout(struct k_work *work)
     }
 
     /* Check if position has advanced */
-    if (dev_data->rx_holding_buffer_length != dev_data->rx_len - st.pending_length && st.pending_length != dev_data->rx_len) {
+    if (dev_data->rx_holding_buffer_length != dev_data->rx_len - st.pending_length) {
         /* New data received - restart timeout */
         dev_data->rx_holding_buffer_length = dev_data->rx_len - st.pending_length;
         k_work_reschedule(&dev_data->rx_timeout_work,
@@ -1050,14 +1050,19 @@ static int uart_sam_rx_enable(const struct device *dev, uint8_t *buf,
         goto error_cleanup;
     }
 
-    /* Enable UART receiver and error interrupts */
-    regs->UART_CR = UART_CR_RSTSTA | UART_CR_RXEN;
-    regs->UART_IER = UART_SR_OVRE | UART_SR_FRAME | UART_SR_PARE | UART_IER_RXRDY;
-
     ret = dma_start(cfg->dma_dev, cfg->rx_dma_channel);
     if (ret != 0) {
         goto error_cleanup;
     }
+    // Must be suspended on startup
+    ret = dma_suspend(cfg->dma_dev, cfg->rx_dma_channel);
+    if (ret != 0) {
+        goto error_cleanup;
+    }
+
+    /* Enable UART receiver and error interrupts */
+    regs->UART_CR = UART_CR_RSTSTA | UART_CR_RXEN;
+    regs->UART_IER = UART_SR_OVRE | UART_SR_FRAME | UART_SR_PARE | UART_IER_RXRDY;
 
     irq_unlock(key);
     return 0;
@@ -1132,31 +1137,58 @@ static int uart_sam_rx_disable(const struct device *dev)
 
 #endif
 
+static inline int uart_sam_wait_dma_stopped(const struct device *dev, k_timeout_t timeout)
+{
+    const struct uart_sam_dev_cfg *cfg = dev->config;
+    struct dma_status st;
+    uint64_t end_time = k_uptime_get() + timeout.ticks;
+    if (dma_get_status(cfg->dma_dev, cfg->rx_dma_channel, &st) != 0) {
+        return -EIO;
+    }
+    uint32_t initial_pending = st.pending_length;
+
+    do {
+        k_sleep(K_USEC(10));
+
+        if (dma_get_status(cfg->dma_dev, cfg->rx_dma_channel, &st) != 0) {
+            return -EIO;
+        }
+
+        if (!st.busy && initial_pending == st.pending_length) {
+            /* Add barrier to ensure no pending writes */
+            __DSB();
+            return 0;
+        }
+        initial_pending = st.pending_length;
+    } while (k_uptime_get() < end_time);
+
+    return -ETIMEDOUT;
+}
+
 static inline int uart_sam_switch_to_next_rx_buffer(const struct device *dev)
 {
     struct uart_sam_dev_data *const data = dev->data;
     const struct uart_sam_dev_cfg *cfg = dev->config;
-    struct dma_status st;
 
-    /* Verify DMA is stopped before touching buffers */
-    if (dma_get_status(cfg->dma_dev, cfg->rx_dma_channel, &st) != 0) {
-        LOG_ERR("Cannot get DMA status during buffer switch");
-        return -EIO;
+    int ret = dma_stop(cfg->dma_dev, cfg->rx_dma_channel);
+    if (ret != 0) {
+        LOG_ERR("DMA failed to stop: %d", ret);
+        uart_sam_abort_rx(dev, UART_ERROR_OVERRUN);
+        return -EINVAL;
     }
+    __DSB();  /* Data Synchronization Barrier */
 
-    if (st.busy) {
-        LOG_ERR("DMA still busy during buffer switch!");
-        return -EBUSY;
-    }
-
-    /* Release old buffer */
-    if (!data->async_cb) {
+    ret = uart_sam_wait_dma_stopped(dev, K_MSEC(10));
+    if (ret != 0) {
+        LOG_ERR("DMA failed to stop: %d", ret);
+        uart_sam_abort_rx(dev, UART_ERROR_OVERRUN);
         return -EINVAL;
     }
 
     struct uart_event evt = {
         .type = UART_RX_BUF_RELEASED,
         .data.rx_buf.buf = data->rx_buf,
+        .data.rx.len = data->rx_len,
     };
     data->async_cb(dev, &evt, data->async_cb_data);
 
@@ -1185,7 +1217,7 @@ static inline int uart_sam_switch_to_next_rx_buffer(const struct device *dev)
     Uart *regs = cfg->regs;
 
     /* Reload DMA configuration */
-    int ret = dma_reload(cfg->dma_dev, cfg->rx_dma_channel,
+    ret = dma_reload(cfg->dma_dev, cfg->rx_dma_channel,
                         (uintptr_t)(&regs->UART_RHR),
                         (uintptr_t)data->rx_buf,
                         data->rx_len);
@@ -1198,6 +1230,7 @@ static inline int uart_sam_switch_to_next_rx_buffer(const struct device *dev)
     __DSB();
     __ISB();
 
+    struct dma_status st;
     /* Verify DMA configuration was accepted */
     if (dma_get_status(cfg->dma_dev, cfg->rx_dma_channel, &st) != 0) {
         LOG_ERR("Cannot verify DMA config after reload");
@@ -1211,35 +1244,8 @@ static inline int uart_sam_switch_to_next_rx_buffer(const struct device *dev)
         return -EINVAL;
     }
 
-    return 0;
-}
-
-static int uart_sam_wait_dma_stopped(const struct device *dev, k_timeout_t timeout)
-{
-    const struct uart_sam_dev_cfg *cfg = dev->config;
-    struct dma_status st;
-    uint64_t end_time = k_uptime_get() + timeout.ticks;
-    if (dma_get_status(cfg->dma_dev, cfg->rx_dma_channel, &st) != 0) {
-        return -EIO;
-    }
-    uint32_t initial_pending = st.pending_length;
-
-    do {
-        k_sleep(K_USEC(10));
-
-        if (dma_get_status(cfg->dma_dev, cfg->rx_dma_channel, &st) != 0) {
-            return -EIO;
-        }
-
-        if (!st.busy && initial_pending == st.pending_length) {
-            /* Add barrier to ensure no pending writes */
-            __DSB();
-            return 0;
-        }
-        initial_pending = st.pending_length;
-    } while (k_uptime_get() < end_time);
-
-    return -ETIMEDOUT;
+    ret = dma_start(cfg->dma_dev, cfg->rx_dma_channel);
+    return ret;
 }
 
 static void uart_sam_rx_completion_handler(struct k_work *work)
@@ -1276,11 +1282,11 @@ static void uart_sam_rx_completion_handler(struct k_work *work)
             break;
         }
 
-        // Temporarily disable the receiver and wait for dma to stop, then get process it
+        // Temporarily disable the receiver and wait for dma to stop, then process it
         regs->UART_CR = UART_CR_RXDIS;
         __DSB();
         /* For timeout case, ensure DMA is stopped FIRST */
-        if (event->reason == UART_SAM_RX_TIMEOUT) {
+        /* if (event->reason == UART_SAM_RX_TIMEOUT) { */
             /* CRITICAL: Add memory barrier to ensure DMA writes are visible */
 #ifdef CONFIG_DCACHE
             /* Ensure all pending DMA writes complete before reading status */
@@ -1296,7 +1302,7 @@ static void uart_sam_rx_completion_handler(struct k_work *work)
                 uart_sam_abort_rx(dev, UART_ERROR_OVERRUN);
                 break;
             }
-        }
+        /* } */
         ret = dma_get_status(cfg->dma_dev, cfg->rx_dma_channel, &dma_st);
         if (ret != 0) {
             LOG_ERR("Failed to get DMA status: %d", ret);
