@@ -37,7 +37,6 @@
 
 LOG_MODULE_REGISTER(uart_sam, CONFIG_UART_LOG_LEVEL);
 
-#define RX_RING_BUFFER_SIZE 8192
 #define RX_POLL_INTERVAL_MS 25
 
 /* Device constant configuration parameters */
@@ -70,9 +69,10 @@ struct uart_sam_dev_data {
 #endif                                        /* CONFIG_UART_INTERRUPT_DRIVEN */
 
 #ifdef CONFIG_UART_ASYNC_API
-	/* RX ring buffer and pointers */
-	uint8_t rx_ring_buffer[RX_RING_BUFFER_SIZE] __aligned(32);
-	size_t rx_rd_ptr; /* Software read pointer (tracks what we've processed) */
+	/* RX ring buffer */
+	uint8_t *rx_ring;
+	size_t rx_ring_len; /* total length of rx_ring */
+	size_t rx_rd_ptr;   /* read pointer (software) */
 
 	/* Periodic work for RX processing */
 	struct k_work_delayable rx_poll_work;
@@ -274,9 +274,7 @@ static int uart_sam_fifo_read(const struct device *dev, uint8_t *rx_data, const 
 	const struct uart_sam_dev_cfg *const cfg = dev->config;
 
 	volatile Uart *const uart = cfg->regs;
-	int bytes_read;
-
-	bytes_read = 0;
+	int bytes_read = 0;
 
 	while (bytes_read < size) {
 		if (uart->UART_SR & UART_SR_RXRDY) {
@@ -411,15 +409,423 @@ static void uart_sam_isr(const struct device *dev)
 
 #endif /* CONFIG_UART_INTERRUPT_DRIVEN */
 
+// =============================================================================
+// Async UART API Implementation
+// =============================================================================
+
+#ifdef CONFIG_UART_SAM_ASYNC
+
+// =============================================================================
+// DMA TX Implementation
+// =============================================================================
+
+static void uart_sam_dma_tx_done(const struct device *dma_dev, void *arg, uint32_t id,
+				 int error_code)
+{
+	ARG_UNUSED(dma_dev);
+	ARG_UNUSED(id);
+	ARG_UNUSED(error_code);
+
+	struct uart_sam_dev_data *const dev_data = (struct uart_sam_dev_data *)arg;
+	k_work_submit(&dev_data->tx_complete_work);
+}
+
+static void uart_sam_tx_complete_handler(struct k_work *work)
+{
+	struct uart_sam_dev_data *dev_data =
+		CONTAINER_OF(work, struct uart_sam_dev_data, tx_complete_work);
+	const struct device *dev = dev_data->dev;
+
+	struct uart_event evt = {
+		.type = UART_TX_DONE,
+		.data.tx =
+			{
+				.buf = dev_data->tx_buf,
+				.len = dev_data->tx_len,
+			},
+	};
+
+	dev_data->tx_buf = NULL;
+	dev_data->tx_len = 0;
+
+	if (dev_data->async_cb) {
+		dev_data->async_cb(dev, &evt, dev_data->async_cb_data);
+	}
+}
+
+// =============================================================================
+// DMA RX Ring Buffer Implementation
+// =============================================================================
+
+/**
+ * @brief Flush any stale data from the RX FIFO
+ */
+static void uart_sam_flush_rx_fifo(Uart *regs)
+{
+	int flush_count = 0;
+	const int max_flushes = 16; /* Prevent infinite loop */
+
+	/* Read and discard any pending data */
+	while (flush_count++ < max_flushes) {
+		if (!(regs->UART_SR & UART_SR_RXRDY_Msk)) {
+			break;
+		}
+		(void)regs->UART_RHR;
+	}
+
+	/* Clear any error flags */
+	regs->UART_CR = UART_CR_RSTSTA_Msk;
+}
+
+/**
+ * @brief RX polling work handler - implements the ring buffer algorithm
+ *
+ * Definitions:
+ *  - rd_ptr: The next location that should be read from
+ *  - wr_ptr: The next location that will be written to
+ *
+ * Algorithm:
+ * 1. Flush DMA FIFO
+ * 2. Calculate wr_ptr from DMA status: wr_ptr = ublen_max - ublen
+ * 3. Compare wr_ptr with rd_ptr:
+ *    - if wr_ptr > rd_ptr: read from rd_ptr to wr_ptr
+ *    - if wr_ptr < rd_ptr: read to end, then from start to wr_ptr
+ *    - if wr_ptr == rd_ptr: buffer empty, do nothing
+ */
+static void uart_sam_rx_poll_handler(struct k_work *work)
+{
+	struct k_work_delayable *dwork = k_work_delayable_from_work(work);
+	struct uart_sam_dev_data *dev_data =
+		CONTAINER_OF(dwork, struct uart_sam_dev_data, rx_poll_work);
+	const struct device *dev = dev_data->dev;
+	const struct uart_sam_dev_cfg *cfg = dev->config;
+	struct dma_status st;
+	size_t wr_ptr, rd_ptr;
+	size_t bytes_to_read;
+
+	if (!dev_data->rx_enabled) {
+		return;
+	}
+
+	/* Flush DMA FIFO - ensure all pending writes are visible */
+	__DSB();
+	__ISB();
+
+	/* Get DMA status to determine write pointer */
+	if (dma_get_status(cfg->dma_dev, cfg->rx_dma_channel, &st) != 0) {
+		LOG_ERR("Failed to get DMA status");
+		goto reschedule;
+	}
+
+	/* Clamp pending length to the size of the ring buffer*/
+	if (st.pending_length > dev_data->rx_ring_len) {
+		LOG_WRN("DMA status pending_length (%u) > rx_ring_len (%zu); clamping",
+			(unsigned int)st.pending_length, dev_data->rx_ring_len);
+		st.pending_length = dev_data->rx_ring_len;
+	}
+
+	/* Calculate write pointer: wr_ptr = ublen_max - ublen (pending_length) */
+	wr_ptr = dev_data->rx_ring_len - st.pending_length;
+	rd_ptr = dev_data->rx_rd_ptr;
+
+#ifdef CONFIG_DCACHE
+	/* Invalidate cache for the ring buffer to ensure CPU sees DMA data */
+	sys_cache_data_invd_range((void *)dev_data->rx_ring, dev_data->rx_ring_len);
+	__DSB();
+	__ISB();
+#endif
+
+	if (wr_ptr > rd_ptr) {
+		/* Case 1: Simple read from rd_ptr to wr_ptr (no wrap-around) */
+		bytes_to_read = wr_ptr - rd_ptr;
+
+		if (bytes_to_read > 0 && dev_data->async_cb) {
+			struct uart_event evt = {
+				.type = UART_RX_RDY,
+				.data.rx =
+					{
+						.buf = dev_data->rx_ring,
+						.offset = rd_ptr,
+						.len = bytes_to_read,
+					},
+			};
+			dev_data->async_cb(dev, &evt, dev_data->async_cb_data);
+			dev_data->rx_rd_ptr = wr_ptr;
+		}
+	} else if (wr_ptr < rd_ptr) {
+		/* Case 2: Wrap-around */
+
+		/* First chunk: rd_ptr to end of buffer */
+		bytes_to_read = dev_data->rx_ring_len - rd_ptr;
+		if (bytes_to_read > 0 && dev_data->async_cb) {
+			struct uart_event evt = {
+				.type = UART_RX_RDY,
+				.data.rx =
+					{
+						.buf = dev_data->rx_ring,
+						.offset = rd_ptr,
+						.len = bytes_to_read,
+					},
+			};
+			dev_data->async_cb(dev, &evt, dev_data->async_cb_data);
+		}
+
+		/* Second chunk: start of buffer to wr_ptr */
+		if (wr_ptr > 0 && dev_data->async_cb) {
+			struct uart_event evt = {
+				.type = UART_RX_RDY,
+				.data.rx =
+					{
+						.buf = dev_data->rx_ring,
+						.offset = 0,
+						.len = wr_ptr,
+					},
+			};
+			dev_data->async_cb(dev, &evt, dev_data->async_cb_data);
+		}
+
+		dev_data->rx_rd_ptr = wr_ptr;
+	}
+	/* Case 3: Buffer is empty, do nothing */
+
+reschedule:
+	/* Reschedule for next poll (25ms interval) */
+	k_work_reschedule(&dev_data->rx_poll_work, K_MSEC(RX_POLL_INTERVAL_MS));
+}
+
+// =============================================================================
+// Async UART API Implementation
+// =============================================================================
+
+static int uart_sam_callback_set(const struct device *dev, uart_callback_t callback,
+				 void *user_data)
+{
+	struct uart_sam_dev_data *const dev_data = dev->data;
+
+	dev_data->async_cb = callback;
+	dev_data->async_cb_data = user_data;
+
+	return 0;
+}
+
+static int uart_sam_tx(const struct device *dev, const uint8_t *buf, size_t len, int32_t timeout)
+{
+	ARG_UNUSED(timeout);
+
+	struct uart_sam_dev_data *const dev_data = dev->data;
+	const struct uart_sam_dev_cfg *const cfg = dev->config;
+	Uart *regs = cfg->regs;
+	int retval;
+
+	if (cfg->tx_dma_channel == 0xFFU) {
+		return -ENOTSUP;
+	}
+
+	if (len > 0xFFFF) {
+		return -EINVAL;
+	}
+
+	unsigned int key = irq_lock();
+
+	if (dev_data->tx_len != 0U) {
+		irq_unlock(key);
+		return -EBUSY;
+	}
+
+	dev_data->tx_buf = buf;
+	dev_data->tx_len = len;
+
+#ifdef CONFIG_DCACHE
+	/* Flush cache to ensure DMA sees the latest data */
+	sys_cache_data_flush_range((void *)buf, len);
+#endif
+
+	retval = dma_reload(cfg->dma_dev, cfg->tx_dma_channel, (uintptr_t)buf,
+			    (uintptr_t)(&(regs->UART_THR)), len);
+	if (retval != 0) {
+		dev_data->tx_buf = NULL;
+		dev_data->tx_len = 0;
+		irq_unlock(key);
+		return retval;
+	}
+
+	retval = dma_start(cfg->dma_dev, cfg->tx_dma_channel);
+	if (retval != 0) {
+		dev_data->tx_buf = NULL;
+		dev_data->tx_len = 0;
+		irq_unlock(key);
+		return retval;
+	}
+
+	irq_unlock(key);
+	return 0;
+}
+
+static int uart_sam_tx_abort(const struct device *dev)
+{
+	struct uart_sam_dev_data *const dev_data = dev->data;
+	const struct uart_sam_dev_cfg *const cfg = dev->config;
+
+	if (cfg->tx_dma_channel == 0xFFU) {
+		return -ENOTSUP;
+	}
+
+	unsigned int key = irq_lock();
+
+	dma_stop(cfg->dma_dev, cfg->tx_dma_channel);
+
+	if (dev_data->tx_len > 0 && dev_data->async_cb) {
+		struct uart_event evt = {
+			.type = UART_TX_ABORTED,
+			.data.tx =
+				{
+					.buf = dev_data->tx_buf,
+					.len = dev_data->tx_len,
+				},
+		};
+		dev_data->async_cb(dev, &evt, dev_data->async_cb_data);
+	}
+
+	dev_data->tx_buf = NULL;
+	dev_data->tx_len = 0;
+
+	irq_unlock(key);
+	return 0;
+}
+
+static int uart_sam_rx_enable(const struct device *dev, uint8_t *buf, size_t len, int32_t timeout)
+{
+	/* Note: buf and len are not used in ring buffer implementation */
+	ARG_UNUSED(timeout);
+
+	struct uart_sam_dev_data *const dev_data = dev->data;
+	const struct uart_sam_dev_cfg *const cfg = dev->config;
+	Uart *regs = cfg->regs;
+
+	if (cfg->rx_dma_channel == 0xFFU) {
+		return -ENOTSUP;
+	}
+
+	if (!buf || len == 0) {
+		return -EINVAL;
+	}
+
+	if (len > UINT16_MAX) {
+		return -EINVAL;
+	}
+
+	if (dev_data->rx_enabled) {
+		return -EBUSY;
+	}
+
+	/* Reset read pointer */
+	dev_data->rx_rd_ptr = 0;
+
+	/* Flush RX FIFO */
+	uart_sam_flush_rx_fifo(regs);
+
+	dev_data->rx_ring = buf;
+	dev_data->rx_ring_len = len;
+
+	/*
+	 * Configure circular DMA with single descriptor pointing to itself
+	 * This creates a ring buffer where DMA continuously writes
+	 */
+	struct dma_block_config dma_blk = {
+		.source_address = (uintptr_t)&regs->UART_RHR,
+		.dest_address = (uintptr_t)dev_data->rx_ring,
+		.block_size = dev_data->rx_ring_len,
+		.source_addr_adj = DMA_ADDR_ADJ_NO_CHANGE,
+		.dest_addr_adj = DMA_ADDR_ADJ_INCREMENT,
+	};
+
+	struct dma_config dma_cfg = {
+		.channel_direction = PERIPHERAL_TO_MEMORY,
+		.source_data_size = 1,
+		.dest_data_size = 1,
+		.source_burst_length = 1,
+		.dest_burst_length = 1,
+		.block_count = 1,
+		.head_block = &dma_blk,
+		.complete_callback_en = 0, /* No completion callback for circular */
+		.user_data = dev_data,
+		.dma_slot = cfg->rx_dma_request,
+	};
+
+	int ret = dma_config(cfg->dma_dev, cfg->rx_dma_channel, &dma_cfg);
+	if (ret != 0) {
+		LOG_ERR("RX DMA config failed: %d", ret);
+		return ret;
+	}
+
+	ret = dma_start(cfg->dma_dev, cfg->rx_dma_channel);
+	if (ret != 0) {
+		LOG_ERR("RX DMA start failed: %d", ret);
+		return ret;
+	}
+
+	/* Enable receiver */
+	regs->UART_CR = UART_CR_RSTSTA | UART_CR_RXEN;
+
+	dev_data->rx_enabled = true;
+
+	/* Start periodic polling (25ms interval) */
+	k_work_reschedule(&dev_data->rx_poll_work, K_MSEC(RX_POLL_INTERVAL_MS));
+
+	LOG_INF("RX enabled with %zu byte ring buffer, polling every %dms", dev_data->rx_ring_len,
+		RX_POLL_INTERVAL_MS);
+
+	return 0;
+}
+
+static int uart_sam_rx_disable(const struct device *dev)
+{
+	struct uart_sam_dev_data *dev_data = dev->data;
+	const struct uart_sam_dev_cfg *cfg = dev->config;
+	Uart *regs = cfg->regs;
+
+	if (!dev_data->rx_enabled) {
+		return -EFAULT;
+	}
+
+	/* Cancel polling work */
+	k_work_cancel_delayable(&dev_data->rx_poll_work);
+
+	/* Stop DMA */
+	dma_stop(cfg->dma_dev, cfg->rx_dma_channel);
+
+	/* Disable receiver */
+	regs->UART_CR = UART_CR_RXDIS;
+
+	dev_data->rx_enabled = false;
+	dev_data->rx_rd_ptr = 0;
+
+	/* Notify application */
+	if (dev_data->async_cb) {
+		struct uart_event evt = {
+			.type = UART_RX_DISABLED,
+		};
+		dev_data->async_cb(dev, &evt, dev_data->async_cb_data);
+	}
+
+	LOG_INF("RX disabled");
+
+	return 0;
+}
+#endif /* CONFIG_UART_ASYNC_API */
+
+// =============================================================================
+// Driver Initialization
+// =============================================================================
+
 static int uart_sam_init(const struct device *dev)
 {
 	int retval;
-
 	const struct uart_sam_dev_cfg *const cfg = dev->config;
-
 	struct uart_sam_dev_data *const dev_data = dev->data;
-
 	Uart *const uart = cfg->regs;
+
+	dev_data->dev = dev;
 
 	/* Enable UART clock in PMC */
 	(void)clock_control_on(SAM_DT_PMC_CONTROLLER, (clock_control_subsys_t)&cfg->clock_cfg);
@@ -430,13 +836,56 @@ static int uart_sam_init(const struct device *dev)
 		return retval;
 	}
 
-	/* Disable Interrupts */
+	/* Disable all interrupts */
 	uart->UART_IDR = 0xFFFFFFFF;
 
 #ifdef CONFIG_UART_INTERRUPT_DRIVEN
 	cfg->irq_config_func(dev);
 #endif /* CONFIG_UART_INTERRUPT_DRIVEN */
 
+#ifdef CONFIG_UART_SAM_ASYNC
+	/* Verify DMA device is ready */
+	if (!device_is_ready(cfg->dma_dev)) {
+		LOG_ERR("DMA device not ready");
+		return -ENODEV;
+	}
+
+	/* Initialize work items */
+	k_work_init_delayable(&dev_data->rx_poll_work, uart_sam_rx_poll_handler);
+	k_work_init(&dev_data->tx_complete_work, uart_sam_tx_complete_handler);
+
+	/* Configure TX DMA (one-time setup) */
+	if (cfg->tx_dma_channel != 0xFFU) {
+		struct dma_block_config dma_blk = {
+			.block_size = 1,
+			.dest_address = (uintptr_t)(&(uart->UART_THR)),
+			.dest_addr_adj = DMA_ADDR_ADJ_NO_CHANGE,
+			.source_addr_adj = DMA_ADDR_ADJ_INCREMENT,
+		};
+
+		struct dma_config dma_cfg = {
+			.channel_direction = MEMORY_TO_PERIPHERAL,
+			.source_data_size = 1,
+			.dest_data_size = 1,
+			.source_burst_length = 1,
+			.dest_burst_length = 1,
+			.block_count = 1,
+			.head_block = &dma_blk,
+			.complete_callback_en = 1,
+			.dma_callback = uart_sam_dma_tx_done,
+			.user_data = dev_data,
+			.dma_slot = cfg->tx_dma_request,
+		};
+
+		retval = dma_config(cfg->dma_dev, cfg->tx_dma_channel, &dma_cfg);
+		if (retval != 0) {
+			LOG_ERR("TX DMA config failed: %d", retval);
+			return retval;
+		}
+	}
+#endif
+
+	/* Configure UART parameters */
 	struct uart_config uart_config = {
 		.baudrate = dev_data->baud_rate,
 		.parity = UART_CFG_PARITY_NONE,
@@ -444,6 +893,7 @@ static int uart_sam_init(const struct device *dev)
 		.data_bits = UART_CFG_DATA_BITS_8,
 		.flow_ctrl = UART_CFG_FLOW_CTRL_NONE,
 	};
+
 	return uart_sam_configure(dev, &uart_config);
 }
 
@@ -475,14 +925,13 @@ static DEVICE_API(uart, uart_sam_driver_api) = {
 	.irq_update = uart_sam_irq_update,
 	.irq_callback_set = uart_sam_irq_callback_set,
 #endif /* CONFIG_UART_INTERRUPT_DRIVEN */
-#if CONFIG_UART_SAM_ASYNC
+#ifdef CONFIG_UART_SAM_ASYNC
 	.callback_set = uart_sam_callback_set,
 	.tx = uart_sam_tx,
 	.tx_abort = uart_sam_tx_abort,
 	.rx_enable = uart_sam_rx_enable,
-	.rx_buf_rsp = uart_sam_rx_buf_rsp,
 	.rx_disable = uart_sam_rx_disable,
-#endif
+#endif /* CONFIG_UART_SAM_ASYNC */
 };
 
 // =============================================================================
@@ -498,7 +947,6 @@ static DEVICE_API(uart, uart_sam_driver_api) = {
          .tx_dma_request = DT_INST_DMAS_CELL_BY_NAME(n, tx, perid)),   \
         ())
 
-/* Device instantiation macros */
 #define UART_SAM_DECLARE_CFG(n, IRQ_FUNC_INIT)                                                     \
 	static const struct uart_sam_dev_cfg uart##n##_sam_config = {                              \
 		.regs = (Uart *)DT_INST_REG_ADDR(n),                                               \
@@ -506,7 +954,7 @@ static DEVICE_API(uart, uart_sam_driver_api) = {
 		.pcfg = PINCTRL_DT_INST_DEV_CONFIG_GET(n),                                         \
 		IRQ_FUNC_INIT UART_SAM_DMA_INIT(n)};
 
-#ifdef CONFIG_UART_ASYNC_API
+#ifdef CONFIG_UART_INTERRUPT_DRIVEN
 #define UART_SAM_CONFIG_FUNC(n)                                                                    \
 	static void uart##n##_sam_irq_config_func(const struct device *dev)                        \
 	{                                                                                          \
@@ -517,12 +965,12 @@ static DEVICE_API(uart, uart_sam_driver_api) = {
 
 #define UART_SAM_IRQ_CFG_FUNC_INIT(n) .irq_config_func = uart##n##_sam_irq_config_func,
 
-#else /* !CONFIG_UART_ASYNC_API */
+#else /* !CONFIG_UART_INTERRUPT_DRIVEN */
 
 #define UART_SAM_CONFIG_FUNC(n)
 #define UART_SAM_IRQ_CFG_FUNC_INIT(n)
 
-#endif /* CONFIG_UART_ASYNC_API */
+#endif /* CONFIG_UART_INTERRUPT_DRIVEN */
 
 #define UART_SAM_INIT_CFG(n) UART_SAM_DECLARE_CFG(n, UART_SAM_IRQ_CFG_FUNC_INIT(n))
 
