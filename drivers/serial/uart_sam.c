@@ -89,6 +89,10 @@ struct uart_sam_dev_data {
 #endif
 };
 
+// =============================================================================
+// Basic UART Functions (Polling)
+// =============================================================================
+
 static int uart_sam_poll_in(const struct device *dev, unsigned char *c)
 {
 	const struct uart_sam_dev_cfg *const cfg = dev->config;
@@ -108,7 +112,6 @@ static int uart_sam_poll_in(const struct device *dev, unsigned char *c)
 static void uart_sam_poll_out(const struct device *dev, unsigned char c)
 {
 	const struct uart_sam_dev_cfg *const cfg = dev->config;
-
 	Uart *const uart = cfg->regs;
 
 	/* Wait for transmitter to be ready */
@@ -122,35 +125,32 @@ static void uart_sam_poll_out(const struct device *dev, unsigned char c)
 static int uart_sam_err_check(const struct device *dev)
 {
 	const struct uart_sam_dev_cfg *const cfg = dev->config;
-
 	volatile Uart *const uart = cfg->regs;
 	int errors = 0;
 
 	if (uart->UART_SR & UART_SR_OVRE) {
 		errors |= UART_ERROR_OVERRUN;
 	}
-
 	if (uart->UART_SR & UART_SR_PARE) {
 		errors |= UART_ERROR_PARITY;
 	}
-
 	if (uart->UART_SR & UART_SR_FRAME) {
 		errors |= UART_ERROR_FRAMING;
 	}
 
 	uart->UART_CR = UART_CR_RSTSTA;
-
 	return errors;
 }
+
+// =============================================================================
+// UART Configuration
+// =============================================================================
 
 static int uart_sam_baudrate_set(const struct device *dev, uint32_t baudrate)
 {
 	struct uart_sam_dev_data *const dev_data = dev->data;
-
 	const struct uart_sam_dev_cfg *const cfg = dev->config;
-
 	volatile Uart *const uart = cfg->regs;
-
 	uint32_t divisor;
 
 	__ASSERT(baudrate, "baud rate has to be bigger than 0");
@@ -158,14 +158,12 @@ static int uart_sam_baudrate_set(const struct device *dev, uint32_t baudrate)
 		 "MCK frequency is too small to set required baud rate");
 
 	divisor = SOC_ATMEL_SAM_MCK_FREQ_HZ / 16U / baudrate;
-
 	if (divisor > 0xFFFF) {
 		return -EINVAL;
 	}
 
 	uart->UART_BRGR = UART_BRGR_CD(divisor);
 	dev_data->baud_rate = baudrate;
-
 	return 0;
 }
 
@@ -210,9 +208,7 @@ static uint8_t uart_sam_get_parity(const struct device *dev)
 static int uart_sam_configure(const struct device *dev, const struct uart_config *cfg)
 {
 	int retval;
-
 	const struct uart_sam_dev_cfg *const config = dev->config;
-
 	volatile Uart *const uart = config->regs;
 
 	/* Driver only supports 8 data bits, 1 stop bit, and no flow control */
@@ -451,6 +447,10 @@ static int uart_sam_init(const struct device *dev)
 	return uart_sam_configure(dev, &uart_config);
 }
 
+// =============================================================================
+// Driver API Structure
+// =============================================================================
+
 static DEVICE_API(uart, uart_sam_driver_api) = {
 	.poll_in = uart_sam_poll_in,
 	.poll_out = uart_sam_poll_out,
@@ -484,6 +484,10 @@ static DEVICE_API(uart, uart_sam_driver_api) = {
 	.rx_disable = uart_sam_rx_disable,
 #endif
 };
+
+// =============================================================================
+// Device Instantiation Macros
+// =============================================================================
 
 #define UART_SAM_DMA_INIT(n)                                                                       \
 	COND_CODE_1(DT_INST_NODE_HAS_PROP(n, dmas),                        \
