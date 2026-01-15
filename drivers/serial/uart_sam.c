@@ -11,15 +11,34 @@
  * @brief UART driver for Atmel SAM MCU family.
  */
 
+#include <stdint.h>
 #include <errno.h>
 #include <soc.h>
 #include <zephyr/device.h>
+#include <zephyr/devicetree.h>
 #include <zephyr/drivers/clock_control/atmel_sam_pmc.h>
 #include <zephyr/drivers/pinctrl.h>
 #include <zephyr/drivers/uart.h>
 #include <zephyr/init.h>
 #include <zephyr/irq.h>
+#include <zephyr/kernel.h>
+#include <zephyr/logging/log.h>
 #include <zephyr/sys/__assert.h>
+#include <zephyr/sys/clock.h>
+#include <zephyr/sys/util.h>
+
+#ifdef CONFIG_DCACHE
+#include <zephyr/cache.h>
+#endif
+
+#ifdef CONFIG_UART_ASYNC_API
+#include <zephyr/drivers/dma.h>
+#endif
+
+LOG_MODULE_REGISTER(uart_sam, CONFIG_UART_LOG_LEVEL);
+
+#define RX_RING_BUFFER_SIZE 8192
+#define RX_POLL_INTERVAL_MS 25
 
 /* Device constant configuration parameters */
 struct uart_sam_dev_cfg {
@@ -30,16 +49,44 @@ struct uart_sam_dev_cfg {
 #ifdef CONFIG_UART_INTERRUPT_DRIVEN
 	uart_irq_config_func_t irq_config_func;
 #endif
+
+#ifdef CONFIG_UART_ASYNC_API
+	const struct device *dma_dev;
+	uint32_t rx_dma_channel;
+	uint32_t tx_dma_channel;
+	uint32_t rx_dma_request; /* Peripheral ID for DMA handshaking */
+	uint32_t tx_dma_request;
+#endif
 };
 
 /* Device run time data */
 struct uart_sam_dev_data {
+	const struct device *dev;
 	uint32_t baud_rate;
 
 #ifdef CONFIG_UART_INTERRUPT_DRIVEN
 	uart_irq_callback_user_data_t irq_cb; /* Interrupt Callback */
 	void *irq_cb_data;                    /* Interrupt Callback Arg */
 #endif                                        /* CONFIG_UART_INTERRUPT_DRIVEN */
+
+#ifdef CONFIG_UART_ASYNC_API
+	/* RX ring buffer and pointers */
+	uint8_t rx_ring_buffer[RX_RING_BUFFER_SIZE] __aligned(32);
+	size_t rx_rd_ptr; /* Software read pointer (tracks what we've processed) */
+
+	/* Periodic work for RX processing */
+	struct k_work_delayable rx_poll_work;
+
+	/* Async callback */
+	uart_callback_t async_cb;
+	void *async_cb_data;
+	bool rx_enabled;
+
+	/* TX state */
+	const uint8_t *tx_buf;
+	size_t tx_len;
+	struct k_work tx_complete_work;
+#endif
 };
 
 static int uart_sam_poll_in(const struct device *dev, unsigned char *c)
