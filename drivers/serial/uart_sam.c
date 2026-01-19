@@ -37,8 +37,6 @@
 
 LOG_MODULE_REGISTER(uart_sam, CONFIG_UART_LOG_LEVEL);
 
-#define RX_POLL_INTERVAL_MS 25
-
 /* Device constant configuration parameters */
 struct uart_sam_dev_cfg {
 	Uart *regs;
@@ -71,8 +69,10 @@ struct uart_sam_dev_data {
 #ifdef CONFIG_UART_ASYNC_API
 	/* RX ring buffer */
 	uint8_t *rx_ring;
-	size_t rx_ring_len; /* total length of rx_ring */
-	size_t rx_rd_ptr;   /* read pointer (software) */
+	size_t rx_ring_len;        /* total length of rx_ring */
+	size_t rx_rd_ptr;          /* read pointer (software) */
+	int32_t rx_poll_period_ms; /* determines rate at which rx_ring is polled for new data, by
+				      design ensures no DMA writes are missed*/
 
 	/* Periodic work for RX processing */
 	struct k_work_delayable rx_poll_work;
@@ -88,6 +88,12 @@ struct uart_sam_dev_data {
 	struct k_work tx_complete_work;
 #endif
 };
+
+#ifdef CONFIG_UART_ASYNC_API
+/* This maximum poll period for RX buffer ensures a bound on latency (time
+ * between data received by UART and received by software) */
+#define UART_ASYNC_RX_POLL_MAX_PERIOD_MS 50
+#endif
 
 // =============================================================================
 // Basic UART Functions (Polling)
@@ -589,8 +595,8 @@ static void uart_sam_rx_poll_handler(struct k_work *work)
 	/* Case 3: Buffer is empty, do nothing */
 
 reschedule:
-	/* Reschedule for next poll (25ms interval) */
-	k_work_reschedule(&dev_data->rx_poll_work, K_MSEC(RX_POLL_INTERVAL_MS));
+	/* Reschedule for next poll */
+	k_work_reschedule(&dev_data->rx_poll_work, K_MSEC(dev_data->rx_poll_period_ms));
 }
 
 // =============================================================================
@@ -726,6 +732,39 @@ static int uart_sam_rx_enable(const struct device *dev, uint8_t *buf, size_t len
 	dev_data->rx_ring = buf;
 	dev_data->rx_ring_len = len;
 
+	/* To ensure polling is fast enough to prevent RX buffer overflow,
+	 * note that one DMA write corresponds to a single UART frame of 10 bits
+	 * (1 start bit + 8 data bits + 1 stop bit).
+	 *
+	 * Polling is therefore required at least twice as fast as the time needed
+	 * to completely fill the RX buffer, providing a half-buffer safety margin.
+	 *
+	 * Units calculation:
+	 *
+	 *   (c/B * ms/s * B) / (c/s) = ms
+	 *
+	 * where:
+	 *   B  = byte
+	 *   c  = UART character (baud)
+	 *   s  = second
+	 *   ms = millisecond
+	 *
+	 * The calculation intentionally rounds down to guarantee a conservative
+	 * (shorter) polling period and caps the poll period to ensure reasonable
+	 * latency.
+	 */
+
+	/*
+	 * Non-simplified calculation:
+	 * int32_t candidate_rx_poll_period_ms =
+	 * 	(int32_t)((10U * MSEC_PER_SEC * dev_data->rx_ring_len) /
+	 * 		  (dev_data->baud_rate * 2U));
+	 */
+	int32_t candidate_rx_poll_period_ms =
+		(int32_t)((5U * MSEC_PER_SEC * dev_data->rx_ring_len) / dev_data->baud_rate);
+	dev_data->rx_poll_period_ms =
+		MIN(candidate_rx_poll_period_ms, UART_ASYNC_RX_POLL_MAX_PERIOD_MS);
+
 	/*
 	 * Configure circular DMA with single descriptor pointing to itself
 	 * This creates a ring buffer where DMA continuously writes
@@ -769,11 +808,11 @@ static int uart_sam_rx_enable(const struct device *dev, uint8_t *buf, size_t len
 
 	dev_data->rx_enabled = true;
 
-	/* Start periodic polling (25ms interval) */
-	k_work_reschedule(&dev_data->rx_poll_work, K_MSEC(RX_POLL_INTERVAL_MS));
+	/* Start periodic polling */
+	k_work_reschedule(&dev_data->rx_poll_work, K_MSEC(dev_data->rx_poll_period_ms));
 
 	LOG_INF("RX enabled with %zu byte ring buffer, polling every %dms", dev_data->rx_ring_len,
-		RX_POLL_INTERVAL_MS);
+		dev_data->rx_poll_period_ms);
 
 	return 0;
 }
