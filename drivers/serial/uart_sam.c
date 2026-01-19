@@ -695,7 +695,6 @@ static int uart_sam_tx_abort(const struct device *dev)
 
 static int uart_sam_rx_enable(const struct device *dev, uint8_t *buf, size_t len, int32_t timeout)
 {
-	/* Note: buf and len are not used in ring buffer implementation */
 	ARG_UNUSED(timeout);
 
 	struct uart_sam_dev_data *const dev_data = dev->data;
@@ -750,6 +749,7 @@ static int uart_sam_rx_enable(const struct device *dev, uint8_t *buf, size_t len
 		.complete_callback_en = 0, /* No completion callback for circular */
 		.user_data = dev_data,
 		.dma_slot = cfg->rx_dma_request,
+		.cyclic = 1,
 	};
 
 	int ret = dma_config(cfg->dma_dev, cfg->rx_dma_channel, &dma_cfg);

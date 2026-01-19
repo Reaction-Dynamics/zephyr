@@ -46,6 +46,8 @@ struct sam_xdmac_dev_cfg {
 /* Device run time data */
 struct sam_xdmac_dev_data {
 	struct sam_xdmac_channel_cfg dma_channels[DMA_CHANNELS_NO];
+	/* One static descriptor per channel for cyclic / linked-list transfers */
+	struct sam_xdmac_linked_list_desc_view1 ll_desc[DMA_CHANNELS_NO];
 };
 
 static void sam_xdmac_isr(const struct device *dev)
@@ -278,6 +280,33 @@ static int sam_xdmac_config(const struct device *dev, uint32_t channel,
 	transfer_cfg.sa = cfg->head_block->source_address;
 	transfer_cfg.da = cfg->head_block->dest_address;
 	transfer_cfg.ublen = cfg->head_block->block_size >> data_size;
+
+	/*
+	 * Enable cyclic / reload mode using a self-referencing descriptor
+	 */
+	if (cfg->cyclic) {
+		struct sam_xdmac_linked_list_desc_view1 *desc = &dev_data->ll_desc[channel];
+
+		/*
+		 * Build a View-1 descriptor that reloads itself.
+		 * This causes the DMA engine to wrap automatically.
+		 */
+		desc->mbr_sa = transfer_cfg.sa;
+		desc->mbr_da = transfer_cfg.da;
+		desc->mbr_ubc = transfer_cfg.ublen | XDMA_UBC_NDE_FETCH_EN |
+				XDMA_UBC_NSEN_UNCHANGED | XDMA_UBC_NDEN_UNCHANGED |
+				XDMA_UBC_NVIEW_NDV1;
+		desc->mbr_nda = (uintptr_t)desc; /* self-loop */
+
+		/*
+		 * Enable descriptor fetch mode
+		 */
+		transfer_cfg.nda = (uintptr_t)desc;
+		transfer_cfg.ndc = XDMAC_CNDC_NDE_DSCR_FETCH_EN | XDMAC_CNDC_NDSUP_SRC_PARAMS_UNCHANGED | XDMAC_CNDC_NDDUP_DST_PARAMS_UNCHANGED | XDMAC_CNDC_NDVIEW_NDV1;
+	} else {
+		/* Single-shot transfer */
+		transfer_cfg.ndc = XDMAC_CNDC_NDE_DSCR_FETCH_DIS;
+	}
 
 	ret = sam_xdmac_transfer_configure(dev, channel, &transfer_cfg);
 
