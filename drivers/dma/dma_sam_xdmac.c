@@ -382,7 +382,6 @@ int sam_xdmac_transfer_stop(const struct device *dev, uint32_t channel)
 static int xdmac_suspend(const struct device *dev, uint32_t channel)
 {
 	const struct sam_xdmac_dev_cfg *config = dev->config;
-	struct sam_xdmac_dev_data *const dev_data = dev->data;
 
 	Xdmac * const xdmac = config->regs;
 
