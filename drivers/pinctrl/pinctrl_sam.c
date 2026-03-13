@@ -80,7 +80,7 @@ static void pinctrl_configure_pin(pinctrl_soc_pin_t pin)
 		    (port_idx == SAM_PINMUX_PORT_b && pin_idx == 8) ||  // PB8 Alt signal is XOUT
 		    (port_idx == SAM_PINMUX_PORT_b && pin_idx == 13)) { // PB13 Alt signal is DAC0
 			soc_pin.flags |= SOC_GPIO_FUNC_OUT_0;
-		} else {
+		} else if (!(port_idx == SAM_PINMUX_PORT_b && pin_idx == 3)) { // PB3 acts as if it had a pull-up resistor when configured as an input
 			// NOTE this will result in calling soc_pmc_peripheral_enable(periph_id);
 			// with the pio controller id rather than the afec id (which is probably
 			// more correct)
