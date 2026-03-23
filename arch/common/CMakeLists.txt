@@ -110,7 +110,7 @@ if (CONFIG_GEN_ISR_TABLES)
 endif()
 
 if(CONFIG_COVERAGE)
-  zephyr_compile_options($<TARGET_PROPERTY:compiler,coverage>)
+  #zephyr_compile_options($<TARGET_PROPERTY:compiler,coverage>)
   zephyr_link_libraries_ifndef(CONFIG_NATIVE_LIBRARY $<TARGET_PROPERTY:linker,coverage>)
 endif()
 
