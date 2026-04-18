@@ -474,22 +474,40 @@ static int sam_xdmac_get_status(const struct device *dev, uint32_t channel,
 				struct dma_status *status)
 {
 	const struct sam_xdmac_dev_cfg *const dev_cfg = dev->config;
+	Xdmac *const xdmac = dev_cfg->regs;
 
-	Xdmac * const xdmac = dev_cfg->regs;
-	uint32_t chan_cfg = xdmac->XDMAC_CHID[channel].XDMAC_CC;
-	uint32_t ublen = xdmac->XDMAC_CHID[channel].XDMAC_CUBC;
+	uint32_t chan_cfg_0, chan_cfg_1;
+	uint32_t nda0, nda1;
+	uint32_t ublen;
+
+	/* Single-pass stable snapshot attempt */
+	/* See 35.8 XDMAX Software Requirements */
+	nda0 = xdmac->XDMAC_CHID[channel].XDMAC_CNDA;
+	chan_cfg_0 = xdmac->XDMAC_CHID[channel].XDMAC_CC;
+	ublen = xdmac->XDMAC_CHID[channel].XDMAC_CUBC;
+	chan_cfg_1 = xdmac->XDMAC_CHID[channel].XDMAC_CC;
+	nda1 = xdmac->XDMAC_CHID[channel].XDMAC_CNDA;
 
 	/* we need to check some of the XDMAC_CC registers to determine the DMA direction */
-	if ((chan_cfg & XDMAC_CC_TYPE_Msk) == 0) {
+	if ((chan_cfg_1 & XDMAC_CC_TYPE_Msk) == 0) {
 		status->dir = MEMORY_TO_MEMORY;
-	} else if ((chan_cfg & XDMAC_CC_DSYNC_Msk) == XDMAC_CC_DSYNC_MEM2PER) {
+	} else if ((chan_cfg_1 & XDMAC_CC_DSYNC_Msk) == XDMAC_CC_DSYNC_MEM2PER) {
 		status->dir = MEMORY_TO_PERIPHERAL;
 	} else {
 		status->dir = PERIPHERAL_TO_MEMORY;
 	}
 
-	status->busy = (chan_cfg & XDMAC_CC_INITD_Msk) == 0;
+	if ((nda0 != nda1) || ((chan_cfg_0 & XDMAC_CC_INITD_Msk) == 0) ||
+	    ((chan_cfg_1 & XDMAC_CC_INITD_Msk) == 0)) {
+		/* Invalid / unstable read -> treat as busy */
+		status->pending_length = 0;
+		status->busy = true;
+		return 0;
+	}
+
+	/* Valid snapshot */
 	status->pending_length = ublen;
+	status->busy = false;
 
 	return 0;
 }
