@@ -556,8 +556,8 @@ static void uart_sam_rx_poll_handler(struct k_work *work)
 					},
 			};
 			dev_data->async_cb(dev, &evt, dev_data->async_cb_data);
-			dev_data->rx_rd_ptr = wr_ptr;
 		}
+		dev_data->rx_rd_ptr = wr_ptr;
 	} else if (wr_ptr < rd_ptr) {
 		/* Case 2: Wrap-around */
 
@@ -762,6 +762,11 @@ static int uart_sam_rx_enable(const struct device *dev, uint8_t *buf, size_t len
 	 */
 	int32_t candidate_rx_poll_period_ms =
 		(int32_t)((5U * MSEC_PER_SEC * dev_data->rx_ring_len) / dev_data->baud_rate);
+	if (candidate_rx_poll_period_ms == 0) {
+		LOG_ERR("Cannot poll UART fast enough, increase 'rx_ring_len' or decrease "
+			"'baud_rate'");
+		return -EINVAL;
+	}
 	dev_data->rx_poll_period_ms =
 		MIN(candidate_rx_poll_period_ms, UART_ASYNC_RX_POLL_MAX_PERIOD_MS);
 
