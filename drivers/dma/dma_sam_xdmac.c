@@ -246,6 +246,7 @@ static int sam_xdmac_config(const struct device *dev, uint32_t channel,
 	case PERIPHERAL_TO_MEMORY:
 		channel_cfg.cfg =
 			  XDMAC_CC_TYPE_PER_TRAN
+			| XDMAC_CC_MBSIZE(burst_size)
 			| XDMAC_CC_CSIZE(burst_size)
 			| XDMAC_CC_DSYNC_PER2MEM
 			| xdmac_inc_cfg;
