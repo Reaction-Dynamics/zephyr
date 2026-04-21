@@ -46,6 +46,8 @@ struct sam_xdmac_dev_cfg {
 /* Device run time data */
 struct sam_xdmac_dev_data {
 	struct sam_xdmac_channel_cfg dma_channels[DMA_CHANNELS_NO];
+	/* One static descriptor per channel for cyclic / linked-list transfers */
+	struct sam_xdmac_linked_list_desc_view1 ll_desc[DMA_CHANNELS_NO];
 };
 
 static void sam_xdmac_isr(const struct device *dev)
@@ -244,6 +246,7 @@ static int sam_xdmac_config(const struct device *dev, uint32_t channel,
 	case PERIPHERAL_TO_MEMORY:
 		channel_cfg.cfg =
 			  XDMAC_CC_TYPE_PER_TRAN
+			| XDMAC_CC_MBSIZE(burst_size)
 			| XDMAC_CC_CSIZE(burst_size)
 			| XDMAC_CC_DSYNC_PER2MEM
 			| xdmac_inc_cfg;
@@ -278,6 +281,33 @@ static int sam_xdmac_config(const struct device *dev, uint32_t channel,
 	transfer_cfg.sa = cfg->head_block->source_address;
 	transfer_cfg.da = cfg->head_block->dest_address;
 	transfer_cfg.ublen = cfg->head_block->block_size >> data_size;
+
+	/*
+	 * Enable cyclic / reload mode using a self-referencing descriptor
+	 */
+	if (cfg->cyclic) {
+		struct sam_xdmac_linked_list_desc_view1 *desc = &dev_data->ll_desc[channel];
+
+		/*
+		 * Build a View-1 descriptor that reloads itself.
+		 * This causes the DMA engine to wrap automatically.
+		 */
+		desc->mbr_sa = transfer_cfg.sa;
+		desc->mbr_da = transfer_cfg.da;
+		desc->mbr_ubc = transfer_cfg.ublen | XDMA_UBC_NDE_FETCH_EN |
+				XDMA_UBC_NSEN_UNCHANGED | XDMA_UBC_NDEN_UNCHANGED |
+				XDMA_UBC_NVIEW_NDV1;
+		desc->mbr_nda = (uintptr_t)desc; /* self-loop */
+
+		/*
+		 * Enable descriptor fetch mode
+		 */
+		transfer_cfg.nda = (uintptr_t)desc;
+		transfer_cfg.ndc = XDMAC_CNDC_NDE_DSCR_FETCH_EN | XDMAC_CNDC_NDSUP_SRC_PARAMS_UNCHANGED | XDMAC_CNDC_NDDUP_DST_PARAMS_UNCHANGED | XDMAC_CNDC_NDVIEW_NDV1;
+	} else {
+		/* Single-shot transfer */
+		transfer_cfg.ndc = XDMAC_CNDC_NDE_DSCR_FETCH_DIS;
+	}
 
 	ret = sam_xdmac_transfer_configure(dev, channel, &transfer_cfg);
 
@@ -322,6 +352,7 @@ int sam_xdmac_transfer_start(const struct device *dev, uint32_t channel)
 	return 0;
 }
 
+
 int sam_xdmac_transfer_stop(const struct device *dev, uint32_t channel)
 {
 	const struct sam_xdmac_dev_cfg *config = dev->config;
@@ -345,6 +376,71 @@ int sam_xdmac_transfer_stop(const struct device *dev, uint32_t channel)
 	xdmac->XDMAC_CHID[channel].XDMAC_CID = 0xFF;
 	/* Clear the pending Interrupt Status bit(s) */
 	(void)xdmac->XDMAC_CHID[channel].XDMAC_CIS;
+
+	return 0;
+}
+
+static int xdmac_suspend(const struct device *dev, uint32_t channel)
+{
+	const struct sam_xdmac_dev_cfg *config = dev->config;
+
+	Xdmac * const xdmac = config->regs;
+
+	if (channel >= DMA_CHANNELS_NO) {
+		LOG_ERR("Channel %d out of range", channel);
+		return -EINVAL;
+	}
+
+	if (!(xdmac->XDMAC_GS & BIT(channel))) {
+		LOG_DBG("Channel %d not enabled", channel);
+		return -EINVAL;
+	}
+
+#if defined(CONFIG_SOC_SERIES_SAMX7X)
+	if (xdmac->XDMAC_GRS & BIT(channel) || xdmac->XDMAC_GWS & BIT(channel)) {
+#elif defined(CONFIG_SOC_SERIES_SAMA7G5)
+	if (xdmac->XDMAC_GRSS & BIT(channel) || xdmac->XDMAC_GWSS & BIT(channel)) {
+#else
+#error Unsupported SoC family
+#endif
+		LOG_DBG("Channel %d already suspended", channel);
+		return 0;
+	}
+
+	xdmac->XDMAC_GRWS |= BIT(channel);
+
+	return 0;
+}
+
+static int xdmac_resume(const struct device *dev, uint32_t channel)
+{
+	const struct sam_xdmac_dev_cfg *config = dev->config;
+	struct sam_xdmac_dev_data *const dev_data = dev->data;
+
+	Xdmac * const xdmac = config->regs;
+
+	if (channel >= DMA_CHANNELS_NO) {
+		LOG_ERR("Channel %d out of range", channel);
+		return -EINVAL;
+	}
+
+	if (!(xdmac->XDMAC_GS & BIT(channel))) {
+		LOG_DBG("Channel %d not enabled", channel);
+		return -EINVAL;
+	}
+
+#if defined(CONFIG_SOC_SERIES_SAMX7X)
+	if (!(xdmac->XDMAC_GRS & BIT(channel) || xdmac->XDMAC_GWS & BIT(channel))) {
+#elif defined(CONFIG_SOC_SERIES_SAMA7G5)
+	if (!(xdmac->XDMAC_GRSS & BIT(channel) || xdmac->XDMAC_GWSS & BIT(channel))) {
+#else
+#error Unsupported SoC family
+#endif
+		LOG_DBG("Channel %d not suspended", channel);
+		return 0;
+	}
+
+	xdmac->XDMAC_GRWR |= BIT(channel);
 
 	return 0;
 }
@@ -379,22 +475,40 @@ static int sam_xdmac_get_status(const struct device *dev, uint32_t channel,
 				struct dma_status *status)
 {
 	const struct sam_xdmac_dev_cfg *const dev_cfg = dev->config;
+	Xdmac *const xdmac = dev_cfg->regs;
 
-	Xdmac * const xdmac = dev_cfg->regs;
-	uint32_t chan_cfg = xdmac->XDMAC_CHID[channel].XDMAC_CC;
-	uint32_t ublen = xdmac->XDMAC_CHID[channel].XDMAC_CUBC;
+	uint32_t chan_cfg_0, chan_cfg_1;
+	uint32_t nda0, nda1;
+	uint32_t ublen;
+
+	/* Single-pass stable snapshot attempt */
+	/* See 35.8 XDMAX Software Requirements */
+	nda0 = xdmac->XDMAC_CHID[channel].XDMAC_CNDA;
+	chan_cfg_0 = xdmac->XDMAC_CHID[channel].XDMAC_CC;
+	ublen = xdmac->XDMAC_CHID[channel].XDMAC_CUBC;
+	chan_cfg_1 = xdmac->XDMAC_CHID[channel].XDMAC_CC;
+	nda1 = xdmac->XDMAC_CHID[channel].XDMAC_CNDA;
 
 	/* we need to check some of the XDMAC_CC registers to determine the DMA direction */
-	if ((chan_cfg & XDMAC_CC_TYPE_Msk) == 0) {
+	if ((chan_cfg_1 & XDMAC_CC_TYPE_Msk) == 0) {
 		status->dir = MEMORY_TO_MEMORY;
-	} else if ((chan_cfg & XDMAC_CC_DSYNC_Msk) == XDMAC_CC_DSYNC_MEM2PER) {
+	} else if ((chan_cfg_1 & XDMAC_CC_DSYNC_Msk) == XDMAC_CC_DSYNC_MEM2PER) {
 		status->dir = MEMORY_TO_PERIPHERAL;
 	} else {
 		status->dir = PERIPHERAL_TO_MEMORY;
 	}
 
-	status->busy = ((chan_cfg & XDMAC_CC_INITD_Msk) != 0) || (ublen > 0);
+	if ((nda0 != nda1) || ((chan_cfg_0 & XDMAC_CC_INITD_Msk) == 0) ||
+	    ((chan_cfg_1 & XDMAC_CC_INITD_Msk) == 0)) {
+		/* Invalid / unstable read -> treat as busy */
+		status->pending_length = 0;
+		status->busy = true;
+		return 0;
+	}
+
+	/* Valid snapshot */
 	status->pending_length = ublen;
+	status->busy = false;
 
 	return 0;
 }
@@ -404,6 +518,8 @@ static DEVICE_API(dma, sam_xdmac_driver_api) = {
 	.reload = sam_xdmac_transfer_reload,
 	.start = sam_xdmac_transfer_start,
 	.stop = sam_xdmac_transfer_stop,
+	.resume = xdmac_resume,
+	.suspend = xdmac_suspend,
 	.get_status = sam_xdmac_get_status,
 };
 
